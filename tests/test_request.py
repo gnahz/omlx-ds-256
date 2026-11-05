@@ -13,6 +13,37 @@ from omlx.request import (
 )
 
 
+def test_recent_decode_rate_reports_bursts_and_stalls():
+    request = Request("decode", [1], SamplingParams())
+    request.reset_decode_rate(10.0)
+    request.record_decode_tokens(10.2, 2)
+    request.record_decode_tokens(10.21, 3)
+
+    assert request.recent_decode_tokens_per_second(10.9) is None
+    assert request.recent_decode_tokens_per_second(11.0) == 5.0
+
+    request.record_decode_tokens(12.0, 3)
+    assert request.recent_decode_tokens_per_second(13.0) == pytest.approx(8 / 3)
+    assert request.recent_decode_tokens_per_second(13.5) == 1.0
+    assert request.recent_decode_tokens_per_second(15.0) == 0.0
+
+    request.record_decode_tokens(17.0, 9)
+    assert request.recent_decode_tokens_per_second(17.0) == 3.0
+
+
+def test_recent_decode_rate_discards_history_on_requeue():
+    request = Request("decode", [1], SamplingParams(), output_token_ids=[2, 3])
+    request.reset_decode_rate(10.0)
+    request.record_decode_tokens(10.2, 2)
+    request.reset_decode_rate()
+    assert request.recent_decode_tokens_per_second(11.0) is None
+
+    request.reset_decode_rate(11.0)
+    request.record_decode_tokens(11.5, 1)
+    assert request.recent_decode_tokens_per_second(11.9) is None
+    assert request.recent_decode_tokens_per_second(12.0) == 1.0
+
+
 class TestRequestStatus:
     """Test cases for RequestStatus enum."""
 

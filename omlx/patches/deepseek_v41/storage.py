@@ -8,20 +8,25 @@ Resident tables retain their packed bytes; prefetch workers only copy CPU rows.
 
 import ctypes
 import fcntl
+import hashlib
 import json
+import logging
 import math
 import mmap
 import os
 import struct
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+import weakref
+from concurrent.futures import CancelledError, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+from threading import Condition, Lock, RLock
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from .hot_rows import HotRows
 
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
 # safetensors dtype tag -> numpy transport dtype (bf16 travels as raw uint16).
@@ -54,6 +59,119 @@ ROW_READ_RETRY_SECONDS = 60.0
 _MINCORE = ctypes.CDLL(None).mincore
 _MINCORE.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 _MINCORE.restype = ctypes.c_int
+logger = logging.getLogger(__name__)
+
+# Prefill-sized gathers (hundreds of thousands of random 256-byte rows per
+# 8K chunk) bypass the mmap: deduplicated, sorted rows are read by a native
+# pthread pool with direct 4 KiB positional reads (F_NOCACHE), so no clean
+# file pages accumulate in RSS or the unified cache and no Python runs per row.
+# Decode-sized gathers keep the mmap path, where warm pages cost microseconds.
+NATIVE_MIN_ROWS = int(os.environ.get("DS41_ENGRAM_NATIVE_MIN_ROWS", "256"))
+NATIVE_THREADS = int(os.environ.get("DS41_ENGRAM_IO_THREADS", "64"))
+# Decode gathers (L x 24 rows per table) used to fault the mmap one page at a
+# time on the forward's critical path (~6 ms per verify step on new text).
+# They now use the native pool as well, through a cached descriptor so warm
+# rows still cost only a copy.
+DECODE_NATIVE = os.environ.get("DS41_ENGRAM_DECODE_NATIVE", "1") == "1"
+DECODE_THREADS = int(os.environ.get("DS41_ENGRAM_DECODE_THREADS", "16"))
+# Retain only the first prefill chunk's compact, immutable SSD rows. Later
+# chunks already have GPU compute to hide their reads behind. Two released
+# model tables use at most 128 MiB total; 0 restores uncached row reads.
+WARM_ROWS_BYTES = int(
+    max(0, min(64, float(os.environ.get("DS41_ENGRAM_WARM_ROWS_MIB", "64"))))
+    * 1024**2
+)
+# Two released tables: at most 2.5 GiB total, including cache metadata.
+# Set 0 to retain the original first-chunk snapshot behavior.
+HOT_ROWS_BYTES = int(
+    max(0, min(1280, float(os.environ.get("DS41_ENGRAM_HOT_ROWS_MIB", "1280"))))
+    * 1024**2
+)
+NATIVE_ALIGN = 4096
+_F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
+_native_lib = None
+_native_lock = Lock()
+_status_lock = Lock()
+_embedding_refs = []
+_native_stats = {"direct_calls": 0, "cached_calls": 0, "logical_row_bytes": 0,
+                 "fallback_gathers": 0, "lookahead_submissions": 0, "current_submissions": 0}
+
+
+def runtime_status():
+    """Observe reader identity and budgets without row reads or model evaluation."""
+    source = Path(__file__).with_name("engram_io.c")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    library = source.with_name(f"engram_io_v071_{source_sha[:16]}.dylib")
+    with _status_lock:
+        refs = [item for item in _embedding_refs if item() is not None]
+        _embedding_refs[:] = refs
+        stats = dict(_native_stats)
+    embeddings = []
+    for item in refs:
+        embed = item()
+        if embed is None or embed._closed:
+            continue
+        with embed._warm_rows.lock:
+            snapshot = embed._warm_rows.snapshot
+            warm_bytes = (0 if snapshot is None else snapshot[0].nbytes
+                          + sum(raw.nbytes for raw, _ in snapshot[1]))
+        with embed._hot_rows.lock:
+            hot = embed._hot_rows
+            hot_bytes = (0 if hot.tags is None else hot.tags.nbytes + hot.freq.nbytes
+                         + sum(raw.nbytes for raw, _ in hot.data))
+            hot_stats = dict(bytes=hot_bytes, budget_bytes=hot.budget, hits=hot.hits,
+                             queries=hot.queries, admitted=hot.admitted)
+        embeddings.append(dict(path=str(embed._weights._path), resident=embed._resident is not None,
+                               warm_bytes=warm_bytes, hot=hot_stats,
+                               pending_raw_bytes=embed.pending_bytes()))
+    return dict(native_io_requested=os.environ.get("DS41_ENGRAM_NATIVE_IO", "1") == "1",
+                native_library_loaded=_native_lib is not None and _native_lib is not False,
+                source_sha256=source_sha, library_path=str(library),
+                library_sha256=hashlib.sha256(library.read_bytes()).hexdigest() if library.is_file() else None,
+                controls=dict(native_min_rows=NATIVE_MIN_ROWS, native_threads=NATIVE_THREADS,
+                              decode_native=DECODE_NATIVE, decode_threads=DECODE_THREADS,
+                              warm_rows_bytes=WARM_ROWS_BYTES, hot_rows_bytes=HOT_ROWS_BYTES,
+                              lookahead_max_bytes=LOOKAHEAD_MAX_BYTES, page_io_workers=PAGE_IO_WORKERS),
+                stats=stats, embeddings=embeddings)
+
+
+def _native_gather():
+    """Load the candidate's source-pinned native reader; never build at serve time."""
+    global _native_lib
+    with _native_lock:
+        if _native_lib is not None:
+            return _native_lib or None
+        _native_lib = False
+        if os.environ.get("DS41_ENGRAM_NATIVE_IO", "1") != "1":
+            return None
+        try:
+            source = Path(__file__).with_name("engram_io.c")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+            library = source.with_name(f"engram_io_v071_{digest}.dylib")
+            if not library.is_file():
+                raise FileNotFoundError(
+                    "Qualified Engram reader is absent; build_engram_io.py must run before qualification"
+                )
+            lib = ctypes.CDLL(str(library))
+            lib.ds41_engram_gather.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int64,
+            ]
+            lib.ds41_engram_gather.restype = ctypes.c_int
+            _native_lib = lib
+        except Exception as error:  # noqa: BLE001 -- the mmap path stays correct
+            logger.warning(
+                "DeepSeek V4.1 native Engram row reader unavailable (%s); "
+                "using mmap gathers",
+                error,
+            )
+        return _native_lib or None
 
 
 def _read_row_runs(fd, rows, base, row_bytes):
@@ -111,6 +229,7 @@ def _read_row_runs(fd, rows, base, row_bytes):
     return packed[inverse]
 
 
+
 def _resident_buffer(shape, dtype):
     """Share packed Metal storage with CPU gathers, without a host copy."""
     types = {
@@ -133,14 +252,20 @@ def _resident_buffer(shape, dtype):
 
 
 class TensorFile:
-    def __init__(self, path):
+    def __init__(self, path, *, map_file=True):
         self._lock = RLock()
+        self._path = Path(path)
+        self._direct_fd = None
+        self._cached_fd = None
+        self._io = Condition(Lock())
+        self._io_active = 0
         self._file = Path(path).open("rb")  # noqa: SIM115 -- owned until close()
         try:
             length = struct.unpack("<Q", self._file.read(8))[0]
             self.header = json.loads(self._file.read(length))
             self._start = length + 8
-            self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            self._mapping = (mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                             if map_file else None)
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None
             self._last_rearm = 0.0
@@ -259,6 +384,70 @@ class TensorFile:
                 return copied, dtype
             return np.array(view, copy=True), dtype
 
+    def gather_rows(self, key, rows, cached=False):
+        """Copy sorted unique ``rows`` of ``key`` with native direct reads.
+
+        Returns None when the native reader is unavailable. Reads run without
+        the file lock (and without the GIL); close() waits for them instead.
+        ``cached`` reads decode-sized requests through the unified buffer
+        cache (unaligned row reads, fewer threads) so repeated rows stay warm.
+        """
+        lib = _native_gather()
+        if lib is None:
+            return None
+        rows = np.ascontiguousarray(rows, dtype=np.int64)
+        with self._lock:
+            if self._mapping is None:
+                raise RuntimeError("Engram tensor file is closed")
+            entry = self.header[key]
+            dtype = entry["dtype"]
+            if dtype not in SAFETENSORS_NUMPY_DTYPES:
+                raise ValueError(f"Unsupported source tensor dtype: {dtype}")
+            dt = np.dtype(SAFETENSORS_NUMPY_DTYPES[dtype])
+            shape = entry["shape"]
+            start, end = entry["data_offsets"]
+            if end - start != math.prod(shape) * dt.itemsize:
+                raise ValueError(f"Invalid tensor byte length: {key}")
+            if rows.size and (rows.min() < 0 or rows.max() >= shape[0]):
+                raise IndexError("Engram row outside table")
+            attribute = "_cached_fd" if cached else "_direct_fd"
+            if getattr(self, attribute) is None:
+                fd = os.open(self._path, os.O_RDONLY)
+                try:
+                    if not cached:
+                        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                    fcntl.fcntl(fd, _F_RDAHEAD, 0)
+                except OSError:
+                    os.close(fd)
+                    raise
+                setattr(self, attribute, fd)
+            fd = getattr(self, attribute)
+            with self._io:
+                self._io_active += 1
+        try:
+            out = np.empty((rows.size, *shape[1:]), dtype=dt)
+            row_bytes = out.itemsize * math.prod(shape[1:])
+            code = lib.ds41_engram_gather(
+                fd,
+                self._start + start,
+                row_bytes,
+                rows.ctypes.data,
+                rows.size,
+                out.ctypes.data,
+                DECODE_THREADS if cached else NATIVE_THREADS,
+                0 if cached else NATIVE_ALIGN,
+            )
+            if code:
+                raise OSError(code, f"Engram row read failed: {os.strerror(code)}")
+            with _status_lock:
+                _native_stats["cached_calls" if cached else "direct_calls"] += 1
+                _native_stats["logical_row_bytes"] += rows.size * row_bytes
+            return out, dtype
+        finally:
+            with self._io:
+                self._io_active -= 1
+                self._io.notify_all()
+
     def _warm_evicted(self, key, rows, base, row_bytes):
         """Sample warm rows; one uncached page keeps the key on reads for a while."""
         now = time.monotonic()
@@ -304,6 +493,14 @@ class TensorFile:
             if self._mapping is not None:
                 self._mapping.close()
                 self._mapping = None
+            with self._io:
+                while self._io_active:
+                    self._io.wait()
+            for attribute in ("_direct_fd", "_cached_fd"):
+                fd = getattr(self, attribute)
+                if fd is not None:
+                    os.close(fd)
+                    setattr(self, attribute, None)
             self._file.close()
 
 
@@ -336,6 +533,61 @@ def dedupe_tuple_ids(ids):
     if unique.shape[0] == flat.shape[0]:
         return host, None
     return unique, inverse.reshape(host.shape[:-1])
+class _Window:
+    """Gathered rows for consecutive hash positions.
+
+    ``rows`` is [positions, K] (K = n-gram heads per token); the future yields
+    raw bytes per tensor, aligned with ``rows.reshape(-1)``.
+    """
+
+    __slots__ = ("rows", "future", "claimed", "handed_off")
+
+    def __init__(self, rows, future):
+        self.rows = rows
+        self.future = future
+        self.claimed = 0  # positions [0, claimed) were used by a forward
+        self.handed_off = None  # positions >= this were copied into a newer window
+
+    @property
+    def done(self):
+        return self.claimed >= (
+            self.rows.shape[0] if self.handed_off is None else self.handed_off
+        )
+
+
+class _PendingGathers:
+    """Windows gathered ahead of use for one table, oldest first."""
+
+    def __init__(self):
+        self.items = []
+        self.lock = Lock()
+        self.stats = dict.fromkeys(
+            ("read_ahead", "reused", "claimed", "read_at_claim"), 0
+        )
+
+
+class _WarmRows:
+    """One immutable sorted row snapshot, outside the MLX parameter tree."""
+
+    def __init__(self):
+        self.lock = Lock()
+        self.snapshot = None
+
+    def remember(self, rows, data):
+        row_bytes = 8 + sum(raw[0].nbytes for raw, _ in data)
+        count = min(len(rows), WARM_ROWS_BYTES // row_bytes)
+        if count <= 0:
+            return
+        # Own the bounded slice; retaining a view would retain its whole base.
+        snapshot = (
+            rows if count == len(rows) else rows[:count].copy(),
+            tuple(
+                (raw if count == len(rows) else raw[:count].copy(), dtype)
+                for raw, dtype in data
+            ),
+        )
+        with self.lock:
+            self.snapshot = snapshot
 
 
 class DiskEngramEmbedding(nn.Module):
@@ -372,7 +624,12 @@ class DiskEngramEmbedding(nn.Module):
             raise ValueError("Affine Engram requires bits, scales and biases")
         self._closed = False
         self._resident = None
-        self._prefetched = None
+        # Gathers started ahead of use; a plain object, not a Module child.
+        self._queue = _PendingGathers()
+        self._warm_rows = _WarmRows()
+        self._hot_rows = HotRows(HOT_ROWS_BYTES)
+        with _status_lock:
+            _embedding_refs.append(weakref.ref(self))
 
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
@@ -430,16 +687,246 @@ class DiskEngramEmbedding(nn.Module):
                     result.append((raw[rows], dtype))
             return result
 
+    def gather(self, host, *, warm_rows=False):
+        """Raw row bytes for ``host`` ids, as ``_read_rows`` returns them.
+
+        Large requests are deduplicated and sorted, read natively, and expanded
+        back to request order, so every returned byte equals the mmap gather.
+        """
+        flat = np.asarray(host, dtype=np.int64).reshape(-1)
+        cached = flat.size < NATIVE_MIN_ROWS
+        if self._resident is not None or (cached and not DECODE_NATIVE) or not flat.size:
+            return self._read_rows(flat)
+        rows, inverse, counts = np.unique(flat, return_inverse=True, return_counts=True)
+        # The table is immutable and IDs, not prompt positions, are the key.
+        # Decode keeps its existing tiny cached-pread path. Snapshot references
+        # are immutable, so current/lookahead lanes may read concurrently.
+        with self._warm_rows.lock:
+            snapshot = (
+                self._warm_rows.snapshot if WARM_ROWS_BYTES and not cached and not HOT_ROWS_BYTES else None
+            )
+        hits = np.zeros(rows.size, dtype=bool)
+        hot = HOT_ROWS_BYTES and not cached
+        if hot:
+            hits, hot_data = self._hot_rows.lookup(rows)
+        if snapshot is not None:
+            saved, data = snapshot
+            at = np.minimum(np.searchsorted(saved, rows), len(saved) - 1)
+            hits = saved[at] == rows
+        missing = rows[~hits]
+        sources = [
+            (reader, key)
+            for reader, key in (
+                (self._weights, self._weight_key),
+                (self._scales, self._scale_key),
+                (self._scales, self._bias_key),
+            )
+            if key is not None
+        ]
+        if self._closed:
+            raise RuntimeError("Engram embedding is closed")
+        if cached and len(sources) > 1:
+            # Decode reads are SSD-latency bound: fetch the weight and scale
+            # rows concurrently (the native reader releases the GIL).
+            futures = [
+                _PAGE_IO_POOL.submit(reader.gather_rows, key, missing, cached=True)
+                for reader, key in sources
+            ]
+            gathered = [future.result() for future in futures]
+        else:
+            gathered = []
+            for reader, key in sources:
+                gathered.append(reader.gather_rows(key, missing, cached=cached))
+                if gathered[-1] is None:
+                    break
+        if any(got is None for got in gathered):
+            with _status_lock:
+                _native_stats["fallback_gathers"] += 1
+            return self._read_rows(flat)
+        if np.any(hits):
+            merged = []
+            for (raw, dtype), (saved_raw, saved_dtype) in zip(
+                gathered, hot_data if hot else data
+            ):
+                assert dtype == saved_dtype
+                full = np.empty((len(rows), *raw.shape[1:]), dtype=raw.dtype)
+                full[hits] = saved_raw if hot else saved_raw[at[hits]]
+                full[~hits] = raw
+                merged.append((full, dtype))
+            gathered = merged
+        if hot:
+            self._hot_rows.remember(rows, counts, gathered)
+        elif warm_rows and WARM_ROWS_BYTES and not cached:
+            self._warm_rows.remember(rows, gathered)
+        return [(raw[inverse], dtype) for raw, dtype in gathered]
+
+    def _locate(self, host):
+        """Queued window holding the longest run of ``host``'s leading positions.
+
+        Scheduler chunks shrink after being announced and the next
+        announcement starts where the actual chunk ended, so ``host`` usually
+        begins inside a queued window, at offset 0 or where the last claim
+        stopped. Other offsets are found from anchor positions (the first,
+        and the first past the n-gram history, which a wrong history guess
+        cannot change) and verified over the whole overlap. Returns
+        (window, offset, length) or None; caller holds the queue lock.
+        """
+        m, heads = host.shape
+        if not m:
+            return None
+        best, best_score = None, 0.0
+        for window in self._queue.items:
+            rows = window.rows
+            n = rows.shape[0]
+            if rows.shape[1] != heads:
+                continue
+            offsets = [0, window.claimed]
+            for anchor in dict.fromkeys((0, min(3, m - 1))):
+                hits = np.flatnonzero((rows == host[anchor]).all(1)) - anchor
+                offsets += hits[hits >= 0][:32].tolist()
+            for offset in dict.fromkeys(offsets):
+                if offset >= n:
+                    continue
+                length = min(m, n - offset)
+                if length * 4 < n and not window.future.done():
+                    continue  # don't wait on a large read for a small slice of it
+                probe = slice(min(3, length - 1), min(length, 19))
+                if 2 * np.count_nonzero(
+                    rows[offset + probe.start : offset + probe.stop] == host[probe]
+                ) <= (probe.stop - probe.start) * heads:
+                    continue  # a repeated n-gram, not this window's position
+                same = np.count_nonzero(rows[offset : offset + length] == host[:length])
+                if same * 2 > length * heads and same > best_score:
+                    best, best_score = (window, offset, length), same
+        return best
+
+    def pending_bytes(self):
+        with self._queue.lock:
+            return sum(self.selected_bytes(w.rows.size) for w in self._queue.items)
+
+    def add_pending(self, window, limit=6):
+        with self._queue.lock:
+            self._queue.items.append(window)
+            stale = self._queue.items[:-limit]
+            del self._queue.items[:-limit]
+        for old in stale:
+            old.future.cancel()
+
+    def plan(self, host, lane, *, max_bytes=None, warm_rows=False):
+        """Queue a gather of ``host`` on ``lane``, reusing queued windows.
+
+        Leading positions already queued are copied from that window when it
+        completes; only the remainder is read.
+        """
+        rows = np.array(host, dtype=np.int64).reshape(-1, host.shape[-1] if host.ndim else 1)
+        with self._queue.lock:
+            found = self._locate(rows)
+            if found is not None and found[2] == rows.shape[0]:
+                return False
+            if max_bytes is not None:
+                while self._queue.items and (
+                    sum(self.selected_bytes(w.rows.size) for w in self._queue.items)
+                    + self.selected_bytes(rows.size)
+                    > max_bytes
+                ):
+                    self._queue.items.pop(0).future.cancel()
+            if found is None:
+                source, offset, length = None, 0, 0
+            else:
+                source, offset, length = found
+                if offset + length == source.rows.shape[0]:
+                    source.handed_off = offset
+                rows = np.concatenate([source.rows[offset : offset + length], rows[length:]])
+            stats = self._queue.stats
+
+        def job():
+            kept = None
+            if source is not None:
+                try:
+                    kept = source.future.result()
+                except CancelledError:  # evicted before it ran: read it all
+                    pass
+            if kept is None:
+                stats["read_ahead"] += rows.size
+                return self.gather(rows, warm_rows=warm_rows)
+            stats["reused"] += length * rows.shape[1]
+            span = slice(offset * rows.shape[1], (offset + length) * rows.shape[1])
+            kept = [(raw[span], dtype) for raw, dtype in kept]
+            if length == rows.shape[0]:
+                return [(raw.copy(), dtype) for raw, dtype in kept]
+            stats["read_ahead"] += rows[length:].size
+            own = self.gather(rows[length:])
+            return [
+                (np.concatenate([a, b]), dtype) for (a, dtype), (b, _) in zip(kept, own)
+            ]
+
+        self.add_pending(_Window(rows, lane.submit(job)))
+        return True
+
+    def discard_pending(self):
+        with self._queue.lock:
+            pending, self._queue.items = self._queue.items, []
+        for window in pending:
+            if not window.future.cancel():
+                try:
+                    window.future.result()
+                except Exception:  # noqa: BLE001 -- the result is discarded
+                    pass
+
+    def _take_pending(self, host):
+        """Assemble ``host``'s rows from queued windows; read what is missing.
+
+        Row bytes depend only on the row id, so the result equals a
+        synchronous read whatever was planned: positions no window covers and
+        rows planned with a different n-gram history are read here.
+        """
+        rows = host.reshape(-1, host.shape[-1] if host.ndim else 1)
+        m, heads = rows.shape
+        parts, planned, covered = [], [], 0
+        while covered < m:
+            with self._queue.lock:
+                found = self._locate(rows[covered:])
+            if found is None:
+                break
+            window, offset, length = found
+            try:
+                gathered = window.future.result()
+            except CancelledError:  # evicted before it ran
+                with self._queue.lock:
+                    self._queue.items = [w for w in self._queue.items if w is not window]
+                continue
+            span = slice(offset * heads, (offset + length) * heads)
+            parts.append([(raw[span], dtype) for raw, dtype in gathered])
+            planned.append(window.rows[offset : offset + length])
+            with self._queue.lock:
+                window.claimed = max(window.claimed, offset + length)
+                self._queue.items = [w for w in self._queue.items if not w.done]
+            covered += length
+        if not parts:
+            return None
+        stats = self._queue.stats
+        stats["claimed"] += covered * heads
+        if covered < m:
+            parts.append(self.gather(rows[covered:]))
+            planned.append(rows[covered:])
+            stats["read_at_claim"] += (m - covered) * heads
+        data = [
+            (np.concatenate([part[k][0] for part in parts]), parts[0][k][1])
+            for k in range(len(parts[0]))
+        ]
+        wrong = np.flatnonzero(np.concatenate(planned).reshape(-1) != rows.reshape(-1))
+        if wrong.size:
+            stats["read_at_claim"] += wrong.size
+            fixed = self.gather(rows.reshape(-1)[wrong])
+            for (raw, _), (patch, _) in zip(data, fixed):
+                raw[wrong] = patch
+        return data
+
     def __call__(self, indices):
         host = np.asarray(indices).astype(np.int64)
-        pending, self._prefetched = self._prefetched, None
-        if pending is not None:
-            requested, future = pending
-            data = future.result()
-            if not np.array_equal(requested, host):
-                data = self._read_rows(host)
-        else:
-            data = self._read_rows(host)
+        data = self._take_pending(host)
+        if data is None:
+            data = self.gather(host)
         values = decode_array(*data[0])
         if self._bits is not None:
             values = mx.dequantize(
@@ -458,6 +945,10 @@ class DiskEngramEmbedding(nn.Module):
         return values.reshape(*host.shape, values.shape[-1]).astype(mx.bfloat16)
 
     def close(self):
+        self.discard_pending()
+        with self._warm_rows.lock:
+            self._warm_rows.snapshot = None
+        self._hot_rows.clear()
         with self._lock:
             self._closed = True
             self._resident = None
@@ -466,92 +957,105 @@ class DiskEngramEmbedding(nn.Module):
                 self._scales.close()
 
 
-# Include packed rows and their IDs for wider prefill chunks. Only one read
-# remains pending per model; larger gathers still use the synchronous path.
-PREFETCH_BYTES = 64 * 1024 * 1024
+# Host bytes one table may hold in queued windows when a lookahead is queued
+# (an 8192-token chunk is ~52 MB per table); the oldest windows go first.
+LOOKAHEAD_MAX_BYTES = int(os.environ.get("DS41_ENGRAM_LOOKAHEAD_MIB", "256")) << 20
 
 
 class EngramPrefetch:
-    """One pending CPU read per forward, plus an optional next-chunk carry."""
+    """Engram row gathers started before the rows are needed.
+
+    ``submit`` queues a gather on one of two single-thread lanes: lookahead
+    (the next prefill chunk, announced by the scheduler while the current
+    chunk runs on the GPU) and current (rows for the forward in progress), so a
+    long lookahead read never delays a decode step. Each lane is FIFO, so the
+    first Engram layer's rows are read before later layers'. Windows stay
+    queued on the embedding across forwards; a forward takes any prefix or
+    range of them (the scheduler may shrink a chunk after announcing it), and
+    a new announcement copies the unconsumed tail instead of re-reading it.
+    """
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="v41-engram"
-        )
-        self._pending = None
+        self._lanes = {
+            name: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"v41-engram-{name}")
+            for name in ("current", "lookahead")
+        }
+        self._embeds = []
+        self._carry = None
         self._closed = False
 
     def has_pending(self) -> bool:
-        return self._pending is not None
+        return self._carry is not None
 
-    def submit(self, embed, ids):
+    def submit(self, embed, ids, *, lookahead=False, warm_rows=False):
         if self._closed:
             raise RuntimeError("Engram prefetch is closed")
-        host = np.asarray(ids, dtype=np.int64).copy()
         if not isinstance(embed, DiskEngramEmbedding) or embed._resident is not None:
             return
-        host, _ = dedupe_tuple_ids(host)
-        # A carry read activated by a previous chunk is already exactly the
-        # rows this layer consumes; leave it in place instead of re-reading.
-        pending = embed._prefetched
-        if pending is not None and np.array_equal(pending[0], host):
-            return
-        self.drain()
-        if embed.selected_bytes(host.size) + host.nbytes > PREFETCH_BYTES:
-            return
-        future = self._executor.submit(embed._read_rows, host)
-        embed._prefetched = (host, future)
-        self._pending = (embed, future, host)
+        host = np.asarray(ids, dtype=np.int64)
+        if lookahead and embed.selected_bytes(host.size) > LOOKAHEAD_MAX_BYTES:
+            return  # A single announced chunk must also respect its byte cap.
+        lane = self._lanes["lookahead" if lookahead else "current"]
+        embed.plan(
+            host,
+            lane,
+            max_bytes=LOOKAHEAD_MAX_BYTES if lookahead else None,
+            warm_rows=warm_rows,
+        )
+        with _status_lock:
+            _native_stats["lookahead_submissions" if lookahead else "current_submissions"] += 1
+        if embed not in self._embeds:
+            self._embeds.append(embed)
 
     def submit_carry(self, embed, ids):
-        """Start a next-chunk read without installing it on the embed.
+        """Keep an upstream next-chunk read detached until activation.
 
-        The row data stays owned by this manager until ``activate()``; the
-        active forward's own ``_prefetched`` slot remains untouched.
+        Custom scheduler lookahead continues to use the bounded window queue;
+        this bridge gives the 0.7.3 model-level prefetch the same ownership rule.
         """
         if self._closed:
             raise RuntimeError("Engram prefetch is closed")
-        if self._pending is not None:
+        if self._carry is not None:
             raise ValueError("Engram carry prefetch already pending")
-        host = np.asarray(ids, dtype=np.int64).copy()
         if not isinstance(embed, DiskEngramEmbedding) or embed._resident is not None:
             return False
-        host, _ = dedupe_tuple_ids(host)
-        if embed.selected_bytes(host.size) + host.nbytes > PREFETCH_BYTES:
+        host = np.asarray(ids, dtype=np.int64).copy()
+        if embed.selected_bytes(host.size) + host.nbytes > LOOKAHEAD_MAX_BYTES:
             return False
-        future = self._executor.submit(embed._read_rows, host)
-        self._pending = (embed, future, host)
+        rows = host.reshape(-1, host.shape[-1] if host.ndim else 1)
+        future = self._lanes["lookahead"].submit(embed.gather, rows)
+        self._carry = (embed, _Window(rows, future))
         return True
 
     def activate(self) -> bool:
-        """Install a completed next-chunk carry as the active embed read."""
-        pending = self._pending
-        if pending is None:
+        carry, self._carry = self._carry, None
+        if carry is None:
             return False
-        embed, future, host = pending
-        embed._prefetched = (host, future)
+        embed, window = carry
+        embed.add_pending(window)
+        if embed not in self._embeds:
+            self._embeds.append(embed)
         return True
 
     def drain(self):
-        pending, self._pending = self._pending, None
-        if pending is not None:
-            embed, future, _ = pending
-            installed = embed._prefetched
-            if installed is not None and installed[1] is future:
-                embed._prefetched = None
-            if not future.cancel():
-                future.result()
+        carry, self._carry = self._carry, None
+        if carry is not None and not carry[1].future.cancel():
+            carry[1].future.result()
+        for embed in self._embeds:
+            embed.discard_pending()
 
     @contextmanager
     def forward(self):
         try:
             yield self
-        finally:
+        except BaseException:
             self.drain()
+            raise
 
     def close(self):
         self._closed = True
         try:
             self.drain()
         finally:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            for lane in self._lanes.values():
+                lane.shutdown(wait=True, cancel_futures=True)

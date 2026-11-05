@@ -1,475 +1,175 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/icon-rounded-light.svg" width="140">
-    <img alt="oMLX" src="docs/images/icon-rounded-light.svg" width="140">
-  </picture>
-</p>
+# omlx-ds-256
 
-<h1 align="center">oMLX</h1>
-<p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
+DeepSeek V4.1 Flash **1017 LSQ3 / group size 128** on a 256 GiB Apple Silicon Mac, based on **oMLX 0.7.3**.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
-  <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
-</p>
+This fork combines the official [oMLX v0.7.3 release](https://github.com/jundot/omlx/tree/v0.7.3) (`9de79bc39a01c1f3fec1e849903aaf0dd5478d7a`) with the local DeepSeek runtime, native kernels, exact prefix cache, memory admission policy, and dashboard customizations. It is maintained as a standalone source repository. Installation, model downloads, runtime state, and service startup are explicit separate steps.
 
-<p align="center">
-  <a href="mailto:junkim.dot@gmail.com">junkim.dot@gmail.com</a> · <a href="https://omlx.ai/me">https://omlx.ai/me</a>
-</p>
+## What is included
 
-<p align="center">
-  <a href="#install">Install</a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#features">Features</a> ·
-  <a href="#models">Models</a> ·
-  <a href="#cli-configuration">CLI Configuration</a> ·
-  <a href="https://omlx.ai/benchmarks">Benchmarks</a> ·
-  <a href="https://omlx.ai">oMLX.ai</a>
-</p>
+- DeepSeek V4.1 1017 text and vision support, LSQ3/G128 routed experts, MXFP8 backbone projections, quantized embeddings/head, Engram SSD I/O, and MTP drafting.
+- Lossless dictionary compression of expert scale/bias metadata, saving about **7.90 GiB of resident memory** without changing quantization codes. Published metadata is prepared locally; weights are not requantized.
+- Custom packed sparse attention, bounded native prefill workspace, cache growth, projection and decode paths, plus the pinned custom MLX Q3/G128 gather patch.
+- Exact CED prefix caching with image identity, Fibonacci checkpoints, RAM and SSD L2 accounting, and cache controls.
+- Whole-prefill memory reservations, queue admission, physical-memory/load guards, and process-footprint limits.
+- The custom Active Models dashboard: live request phases, recent output rates, queue positions, memory reservations, pending prefill requirements, and exact-cache statistics. The migrated locale changes are included.
+- A portable deployment profile, detached manual lifecycle controls, and memory observation tools under [`deploy/deepseek`](deploy/deepseek).
 
-<p align="center">
-  <b>English</b> ·
-  <a href="README.zh.md">中文</a> ·
-  <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
-</p>
+**A8 prefill is disabled.** The independent LSQ3/G128 A8 experiment did not improve performance on the tested machine and is not selected by this deployment. The custom MLX patch is a Q3/G128 gather implementation, not that A8 prototype.
 
----
+## Hardware and software
 
-<p align="center">
-  <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
-</p>
+The source runtime was validated on an **Apple M5 Ultra with 256 GiB unified memory**, macOS **27.0.1**, Python **3.13**, custom MLX **0.32.4**, and oMLX **0.7.3**. Other configurations need their own validation. This profile is not sized for smaller-memory Macs.
 
-> *Every LLM server I tried made me choose between convenience and control. I wanted to pin everyday models in memory, auto-swap heavier ones on demand, set context limits - and manage it all from a menu bar.*
->
-> *oMLX persists KV cache across a hot in-memory tier and cold SSD tier - even when context changes mid-conversation, all past context stays cached and reusable across requests, making local LLMs practical for real coding work with tools like Claude Code. That's why I built it.*
+You need:
 
-## Install
+- Full Xcode with the Metal compiler/SDK, the command-line developer tools selected, and the Xcode license accepted. The preserved native build targets macOS 27.0; the NAX path additionally needs a compatible GPU and Metal 4 SDK.
+- Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), and a fast local SSD.
+- About **420.53 GiB** for the complete pinned model download, plus build space and up to **60 GiB** for the default SSD prefix-cache budget. Allow extra space for Hugging Face transfer caches and temporary files.
+- Enough free physical memory for roughly **216 GiB** of resident model tensors plus runtime workspaces and the rest of the system. Stop competing model servers yourself before starting this deployment. The scripts never stop unrelated services.
 
-### macOS App
+## 1. Clone and build the isolated environment
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
-
-### Homebrew
-
-```bash
-brew tap jundot/omlx https://github.com/jundot/omlx
-brew install jundot/omlx/omlx --with-custom-kernel   # With native custom kernels (needs full Xcode)
-# No full Xcode? brew install jundot/omlx/omlx installs without the kernels
-
-# Upgrade to the latest version
-brew update && brew upgrade omlx
-
-# Run as a background service (auto-restarts on crash)
-omlx start
-
-# Optional: MCP (Model Context Protocol) support, then restart to load it
-/opt/homebrew/opt/omlx/libexec/bin/pip install mcp
-omlx restart
+```sh
+git clone https://github.com/gnahz/omlx-ds-256.git
+cd omlx-ds-256
+export OMLX_DS_STATE="$HOME/.local/share/omlx-ds-256"
+uv python install 3.13
+./deploy/deepseek/bootstrap.sh
 ```
 
-### From Source
+The bootstrap builds the pinned custom MLX source and the oMLX native extensions. Dependency commits, ABI pins, and the MLX patch are recorded in [`dependency-lock.json`](deploy/deepseek/dependency-lock.json). This is a build-critical dependency lock, not a lock of every transitive package. The default build parallelism is two jobs.
 
-```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
-make install                # Editable install with the web UI and native custom kernels
-# No full Xcode? make install-no-kernels installs without the kernels
-make mcp                    # Optional: MCP support, restart `omlx serve` to load it
+Keep the checkout at its installed location. Runtime state, the Python environment, build dependencies, logs, API key, settings, and caches live under `OMLX_DS_STATE`; downloaded models live in a separate directory. The bootstrap does **not** start a server or download model weights.
+
+Use this bootstrap for the DeepSeek profile. A generic upstream `pip install`, Homebrew upgrade, or official app install does not reproduce the custom MLX build. Replacing it with a stock wheel having the same version number can remove required kernels.
+
+## 2. Download the correct model
+
+Use the **1017** checkpoint:
+
+- Model: [gnahzhang/DeepSeek-V4.1-Flash-1017-LSQ3-G128-MLX](https://huggingface.co/gnahzhang/DeepSeek-V4.1-Flash-1017-LSQ3-G128-MLX)
+- Pinned revision: `c98bd97baca052f484c1d6ea6b6e8a8eced404ef`
+- File identities: [`model-manifest.json`](deploy/deepseek/model-manifest.json)
+
+The older model whose name omits `1017` is a different release. The model repository also contains an older runtime bundle; use **this repository's** deployment scripts for oMLX 0.7.3.
+
+```sh
+export OMLX_DS_STATE="$HOME/.local/share/omlx-ds-256"
+export MODEL_DIR="$HOME/Models/DeepSeek-V4.1-Flash-1017-LSQ3-G128-MLX"
+export METADATA_DIR="${MODEL_DIR}-exact-metadata"
+export PATH="$OMLX_DS_STATE/venv/bin:$PATH"
+
+# Preview the pinned download without fetching weights.
+python deploy/deepseek/download_model.py --model-dir "$MODEL_DIR" --dry-run
+
+# Download the full snapshot and verify its published checksums.
+python deploy/deepseek/download_model.py --model-dir "$MODEL_DIR"
 ```
 
-Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4/M5).
+The helper calls the current `hf download` CLI with the pinned revision and two download workers. Keep the complete snapshot, including Engram tables, vision weights, all MTP stages, tokenizer files, and `exact-metadata/`. Do not use an exclude pattern that drops these files. Public model downloads do not require an API token; if your environment requires authentication, use `hf auth login` locally.
 
-> **Note on native custom kernels:** GLM-5.2, MiniMax M3, and Qwen3.5 need them.
-> Without them those families silently fall back to much slower generic paths --
-> for GLM-5.2 the fused DSA prefill is roughly 30x faster with the kernels
-> (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also uses more
-> memory (#2137). `make install` builds them and checks that each one loads. That
-> needs full Xcode with the Metal toolchain (`xcodebuild -downloadComponent
-> MetalToolchain`); Command Line Tools alone do not provide it (`xcrun: error:
-> unable to find utility "metal"`). Without Xcode, use the official DMG, which
-> ships the kernels precompiled, or `make install-no-kernels`. A plain
-> `pip install -e .` also skips them. `make kernels` rebuilds only the kernels
-> from scratch. Homebrew builds them with `--with-custom-kernel`, which also needs
-> full Xcode. To verify any install:
->
-> ```bash
-> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
-> ```
+Checksum verification reads the complete download with a bounded buffer, so it takes substantial SSD read time. It does not load the model into memory. To verify a snapshot downloaded manually with `hf download`, run:
 
-## Quickstart
-
-### macOS App
-
-Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it. To connect OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, or DeepSeek Harness, see [Integrations](#integrations).
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.34.30.png" alt="oMLX Menubar" width="240">
-</p>
-
-### CLI
-
-```bash
-# Managed background server (macOS app or Homebrew install)
-omlx start
-omlx stop
-omlx restart
-
-# Foreground server attached to this terminal
-omlx serve --model-dir ~/models
+```sh
+python deploy/deepseek/download_model.py --model-dir "$MODEL_DIR" --verify-only
 ```
 
-The server discovers LLMs, VLMs, embedding models, and rerankers from subdirectories automatically. Any OpenAI-compatible client can connect to `http://localhost:8000/v1`. A built-in chat UI is also available at `http://localhost:8000/admin/chat`.
+## 3. Prepare exact metadata and configure
 
-### Homebrew Service
+```sh
+python deploy/deepseek/prepare_metadata.py \
+  --model-dir "$MODEL_DIR" \
+  --output "$METADATA_DIR"
 
-If you installed via Homebrew, you can run oMLX as a managed background service:
-
-```bash
-omlx start                    # Start via brew services
-omlx stop                     # Stop
-omlx restart                  # Restart
-
-brew services start omlx    # Start (auto-restarts on crash)
-brew services stop omlx     # Stop
-brew services restart omlx  # Restart
-brew services info omlx     # Check status
+./deploy/deepseek/service.sh configure \
+  --model-path "$MODEL_DIR" \
+  --metadata-proof "$METADATA_DIR/metadata-proof.json"
 ```
 
-The service runs `omlx serve` with zero-config defaults (`~/.omlx/models`, port 8000). `omlx start`, `omlx stop`, and `omlx restart` are the portable lifecycle commands; Homebrew installs delegate them to `brew services`. To customize, either set environment variables (`OMLX_MODEL_DIR`, `OMLX_PORT`, etc.) or run `omlx serve --model-dir /your/path` once to persist settings to `~/.omlx/settings.json`.
+Preparation checks the verified download and the published metadata proof, reads bounded safetensors headers, and creates hardlinks for the 120 encoded metadata files. `METADATA_DIR` must be a **new directory outside the checkpoint on the same filesystem**. The downloaded checkpoint bytes are preserved, and no second overlay payload is copied. Preparation adds the local file identities needed by the runtime.
 
-Logs are written to two locations:
-- **Service log**: `$(brew --prefix)/var/log/omlx.log` (stdout/stderr)
-- **Server log**: `~/.omlx/logs/server.log` (structured application log)
+Configuration creates a private API key at `$OMLX_DS_STATE/api-key`, private settings, a model registry entry named `deepseek-v41-lsq`, and separate cache directories. The default endpoint is **127.0.0.1:8080**. To select another address or port, add `--host` and `--port` to `configure` before starting.
 
-## Features
+## 4. Start, stop, and restart
 
-Supports text LLMs, vision-language models (VLM), OCR models, embeddings, and rerankers on Apple Silicon.
-
-### Admin Dashboard
-
-Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, and per-model settings. Supports English, Korean, Japanese, Chinese, French, Russian, Spanish, and Brazilian Portuguese. All CDN dependencies are vendored for fully offline operation.
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
-</p>
-
-### Experimental Multi-Mac Inference
-
-Source builds can split one downloaded language model across unequal-memory Macs
-using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
-dashboard handles read-only peer discovery, strict SSH/runtime verification,
-byte-aware unequal shard planning, measured compute/link rebalancing,
-headroom-aware execution tuning, activation, and a live shard/performance map
-on both Macs. Interactive, balanced, and throughput profiles expose coalesced
-batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
-and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/experimental/distributed-cluster.md) for setup,
-security boundaries, current limitations, and the physical-hardware validation
-checklist.
-
-### Vision-Language Models
-
-Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints (dense and MoE) accept native video input as base64 `video_url` / `input_video` data URIs; video needs OpenCV (`opencv-python-headless`). oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
-
-### Tiered KV Cache (Hot + Cold)
-
-Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-on-Write. The cache operates across two tiers:
-
-- **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
-- **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
-
-Optional [Affine4](docs/affine4.md) and [Affine8](docs/affine8.md) KV compression add signed 4-bit and 8-bit cache formats with Metal TensorOps decode attention and a portable fallback. Select either under **Model settings → Memory Saving → KV cache compression**.
-
-<p align="center">
-  <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
-</p>
-
-### Continuous Batching
-
-Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requests is configurable via CLI or admin panel.
-
-### Claude Code Optimization
-
-Runs smaller context models with Claude Code by reporting the model's real context window to auto-compact instead of scaling token counts, and SSE keep-alive prevents read timeouts during long prefill.
-
-### Multi-Model Serving
-
-Load LLMs, VLMs, embedding models, and rerankers within the same server. Models are managed through a combination of automatic and manual controls:
-
-- **LRU eviction**: Least-recently-used models are evicted automatically when memory runs low.
-- **Manual load/unload**: Interactive status badges in the admin panel let you load or unload models on demand.
-- **Model pinning**: Pin frequently used models to keep them always loaded.
-- **Per-model TTL**: Set an idle timeout per model to auto-unload after a period of inactivity.
-- **Process memory enforcement**: Total memory limit (default: system RAM - 8GB) prevents system-wide OOM.
-
-### Per-Model Settings
-
-Configure sampling parameters, chat template kwargs, TTL, model alias, model type override, and more per model directly from the admin panel. Changes apply immediately without server restart.
-
-- **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
-- **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
-- **External engine**: serve the models [Splash](https://github.com/incoai/splash) supports, including GGUF files, from your model directories on Splash's Metal engine in its own process. See [docs/Splash.md](docs/Splash.md) for the supported models and Splash versions.
-- **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
-
-<p align="center">
-  <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
-</p>
-
-### Built-in Chat
-
-Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
-
-Document attachments support PDF, DOCX, PPTX, TXT, and MD. If a client reports only the generic `application/octet-stream` MIME type, oMLX infers the converter MIME type from the supported filename extension; unsupported extensions and explicit unsupported MIME types remain rejected.
-
-<p align="center">
-  <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
-</p>
-
-
-### Model Downloader
-
-Search and download models from HuggingFace directly in the admin dashboard, in MLX, GGUF or all formats. Browse model cards, then pick the files to download: an MLX checkpoint keeps the files it needs, and a GGUF brings its vision projector.
-
-<p align="center">
-  <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
-</p>
-
-### Integrations
-
-Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and DeepSeek Harness directly from the admin dashboard with a single click. No manual config editing required.
-
-<p align="center">
-  <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
-</p>
-
-Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
-
-### Performance Benchmark
-
-One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.
-
-<p align="center">
-  <img src="docs/images/benchmark_omlx.png" alt="oMLX Benchmark Tool" width="720">
-</p>
-
-### macOS Menubar App
-
-Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes [local usage history](docs/usage-analytics.md) with per-model totals and an hourly heatmap, persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
-
-<p align="center">
-  <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
-</p>
-
-### API Compatibility
-
-Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /v1/chat/completions` | Chat completions (streaming) |
-| `POST /v1/completions` | Text completions (streaming) |
-| `POST /v1/messages` | Anthropic Messages API |
-| `POST /v1/embeddings` | Text embeddings |
-| `POST /v1/rerank` | Document reranking |
-| `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
-| `GET /v1/models` | List available models |
-| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
-
-The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
-
-### Tool Calling & Structured Output
-
-Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
-
-| Model Family | Format |
-|---|---|
-| Llama, Qwen, DeepSeek, etc. | JSON `<tool_call>` |
-| Qwen3.5 Series, Raon-1 mini | XML `<function=...>` |
-| Gemma | `<start_function_call>` |
-| GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
-| MiniMax | Namespaced `<minimax:tool_call>` |
-| Mistral | `[TOOL_CALLS]` |
-| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`. Requires `omlx[grammar]` |
-| Kimi K2 | `<\|tool_calls_section_begin\|>` |
-| Longcat | `<longcat_tool_call>` |
-
-Models not listed above may still work if their chat template accepts `tools` and their output uses a recognized `<tool_call>` XML format. For tool-enabled streaming, assistant text is emitted incrementally while known tool-call control markup is suppressed from visible content; structured tool calls are emitted after parsing the completed turn.
-
-A bare JSON, EBNF, or regex grammar constrains the answer from the first generated token, so `thinking_budget` is ignored. Configure a compatible `reasoning_parser` to combine constrained output with a separate, budgeted reasoning phase.
-
-## Models
-
-Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported. GGUF files in these folders are listed one model per file and run on an [external engine](docs/Splash.md#gguf-models).
-
-```
-~/models/
-├── Step-3.5-Flash-8bit/
-├── Qwen3-Coder-Next-8bit/
-├── gpt-oss-120b-MXFP4-Q8/
-├── Qwen3.5-122B-A10B-4bit/
-└── bge-m3/
+```sh
+./deploy/deepseek/service.sh start
+./deploy/deepseek/service.sh status
+./deploy/deepseek/service.sh stop
+./deploy/deepseek/service.sh restart
 ```
 
-Models are auto-detected by type. You can also download models directly from the admin dashboard.
+The scripts also work from another directory when called by their absolute path. Keep `OMLX_DS_STATE` set consistently if you use a non-default location.
 
-| Type | Models |
-|------|--------|
-| LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
-| OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
-| Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
-| Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+`start` launches an independent detached process with its own PID, writes logs to `$OMLX_DS_STATE/logs/service.log`, and waits for model/runtime readiness. It refuses an occupied port or an unsafe memory situation. PID identity checks and lifecycle locking prevent duplicate launches and prevent signalling unrelated processes. `restart` waits for the owned process to exit before loading its replacement. A failed or timed-out start reports the log location.
 
-## CLI Configuration
+The service continues after the terminal or chat closes. A PID-bound `caffeinate -i -w` assertion prevents idle sleep while this service is alive; it ends automatically with the service and does not change global macOS power settings. This manual launcher does not install a login item or automatic reboot/recovery service.
 
-```bash
-# Managed background server (macOS app or Homebrew install)
-omlx start
-omlx stop
-omlx restart
+## 5. Use the API and dashboard
 
-# Start with default settings (memory guard tier = balanced, manage via admin UI)
-omlx serve --model-dir ~/models
+Open [http://127.0.0.1:8080/admin](http://127.0.0.1:8080/admin) and authenticate with your local key when prompted. The API is OpenAI-compatible:
 
-# Choose a memory guard tier at startup
-omlx serve --model-dir ~/models --memory-guard safe
+```sh
+export OMLX_DS_STATE="$HOME/.local/share/omlx-ds-256"
+export OMLX_API_KEY="$(cat "$OMLX_DS_STATE/api-key")"
 
-# Set a custom memory guard ceiling in GB
-omlx serve --model-dir ~/models --memory-guard-gb 48
+curl http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer $OMLX_API_KEY"
 
-# Enable SSD cache for KV blocks
-omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
-
-# Set in-memory hot cache size
-omlx serve --model-dir ~/models --hot-cache-max-size 20%
-
-# Adjust max concurrent requests (default: 8)
-omlx serve --model-dir ~/models --max-concurrent-requests 16
-
-# With MCP tools
-omlx serve --model-dir ~/models --mcp-config mcp.json
-
-# HuggingFace mirror endpoint (for restricted regions)
-omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
-
-# API key authentication
-omlx serve --model-dir ~/models --api-key your-secret-key
-# Localhost-only: skip verification via admin panel global settings
-
-# Network access requires authentication
-OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
-
-# Inference and admin APIs only, without the web UI (not saved to settings)
-omlx serve --model-dir ~/models --headless
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v41-lsq","messages":[{"role":"user","content":"Explain exact prefix caching in two sentences."}],"max_tokens":256,"stream":true}'
 ```
 
-The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
+## Memory policy and validation limits
 
+The portable profile preserves the source deployment's **240 GiB process cap**, **238 GiB prefill target**, **16 GiB system budget**, **four request slots**, **8192-token prefill chunks**, **2 GiB exact-prefix RAM cache**, and **3 GiB prefill pool**. Admission depends on current physical headroom and reservations; four slots do not promise four arbitrary long contexts can run simultaneously. The configured 1,048,576-token context ceiling is not a validated workload size.
 
-Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
-Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. "Disable all authentication" (`skip_api_key_verification`) turns off both inference and admin authentication, so it stays restricted to loopback-only binds.
+For acceptance runs, record a baseline and the maximum compressor physical occupancy throughout the run. Limits are **2 GiB peak compressor growth** and **100 MiB cumulative new swap-in plus swap-out**, with normal memory pressure and all process/runtime guards still enforced. Existing swap is part of the baseline. Do not increase memory ceilings to make a request fit.
 
-For keyless inference on a network bind, turn on "Allow inference without API key" in the web admin settings or the Security screen of the macOS app. It sets `auth.allow_unauthenticated_inference`, defaults to `false`, and applies without a restart. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. Management endpoints still require the main API key or an admin login.
+The original runtime completed one cold **372,432-token multimodal request with 4,096 output tokens** on the machine above. That was a single-request validation; simultaneous long-context workloads are still limited by physical memory. Image-bearing long prefill can occupy a scheduler step for an extended period even while the HTTP server remains responsive.
 
-<details>
-<summary>Architecture</summary>
+This repository packaging was checked with CPU tests, source/patch checks, and simulated lifecycle tests. A fresh install of the portable package has **not** been qualified with model loading or inference. See [`validation.md`](docs/deepseek/validation.md) for the test scope, known numerical differences, and release limitations.
 
-```
-FastAPI Server (OpenAI / Anthropic API)
-    │
-    ├── EnginePool (multi-model, LRU eviction, TTL, manual load/unload)
-    │   ├── BatchedEngine (LLMs, continuous batching)
-    │   ├── VLMEngine (vision-language models)
-    │   ├── EmbeddingEngine
-    │   ├── RerankerEngine
-    │   └── DecisionEngine
-    │
-    ├── ProcessMemoryEnforcer (total memory limit, TTL checks)
-    │
-    ├── Scheduler (FCFS, configurable concurrency)
-    │   └── mlx-lm BatchGenerator
-    │
-    └── Cache Stack
-        ├── PagedCacheManager (GPU, block-based, CoW, prefix sharing)
-        ├── Hot Cache (in-memory tier, write-back)
-        └── PagedSSDCacheManager (SSD cold tier, safetensors format)
+### Record memory and process exits
+
+The optional recorder is an independent launchd job with a label unique to this state directory. It records host memory/pressure, process footprint, thermal information, and process-exit events without making inference requests:
+
+```sh
+./deploy/deepseek/recorder.sh start
+./deploy/deepseek/recorder.sh status
+./deploy/deepseek/recorder.sh stop
 ```
 
-</details>
+Recorder data is stored under `$OMLX_DS_STATE/logs/flight-recorder`. Start it before a long-context run so it captures the baseline. The bootstrap builds its small CPU telemetry helpers; no recorder is started automatically by installation.
 
-## Development
+For a bounded acceptance run, use a second terminal and start this observer before starting the model service:
 
-### Build commands
-
-| Command | What it does |
-|---|---|
-| `make install` | Editable install of the server and the web UI, then the native custom kernels |
-| `make install-no-kernels` | The same without the kernels, for machines without full Xcode |
-| `make mcp` | Add MCP (Model Context Protocol) support |
-| `make dev` | Same as `make install`, with dev tools (`make dev-no-kernels` skips the kernels) |
-| `make kernels` | Delete any built native custom kernels, compile them again in place, and check that each one loads |
-| `make web` | Rebuild the web UI CSS and normalize the translation files |
-| `make app` | Stage a runnable `oMLX.app` with freshly compiled native custom kernels |
-
-The native custom kernels need full Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`).
-
-### CLI Server
-
-```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
-make dev
-pytest
+```sh
+"$OMLX_DS_STATE/venv/bin/python" deploy/deepseek/observe_omlx_cycle.py \
+  --name validation-1 \
+  --output-dir "$OMLX_DS_STATE/logs/cycles" \
+  --allowed-compressor-growth-bytes 2147483648 \
+  --allowed-global-swap-bytes 104857600 \
+  --expect-final-stopped
 ```
 
-### Web UI
+After completing the workload and stopping the service with `service.sh stop`, end the observer with Ctrl-C, or create `$OMLX_DS_STATE/logs/cycles/validation-1.stop`. It writes samples and a summary, checks peak growth across the whole run, and verifies that the service has stopped. Use a new name for each run. The observer reports failures; it does not control or terminate the service. Runtime memory guards remain responsible for admission and execution.
 
-The web admin UI lives in `apps/omlx-web/` and ships in the same package, so `make dev` installs it too. After editing its templates, JavaScript, or translations, run `make web` to rebuild the CSS and normalize the translation files.
+## Source layout and provenance
 
-### macOS App
+| Location | Contents |
+| --- | --- |
+| `omlx/patches/deepseek_v41/` | DeepSeek model, quantization, native dispatch, Engram I/O and exact-cache implementation |
+| `omlx/custom_kernels/` | Native attention and matrix-kernel source |
+| `omlx/scheduler.py`, `omlx/request_memory_budget.py` | Request scheduling and memory reservation policy |
+| `apps/omlx-web/` | Dashboard templates, translations and UI tests |
+| `deploy/deepseek/` | Portable build, model preparation, guards and lifecycle controls |
+| `docs/deepseek/source-manifest.json` | Imported source hashes and portability adaptations |
 
-The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `make dev` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
+The complete imported customization set includes auxiliary and experimental paths; their presence does not enable them. The checked deployment profile selects the validated configuration. For general oMLX features, see the [upstream v0.7.3 README](https://github.com/jundot/omlx/blob/v0.7.3/README.md).
 
-```bash
-# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + native kernels + ad-hoc sign)
-make app
+## License and acknowledgements
 
-# Result lands at apps/omlx-mac/build/Stage/oMLX.app
-open apps/omlx-mac/build/Stage/oMLX.app
-
-# Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
-apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-```
-
-First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
-
-## Contributing
-
-Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for details.
-
-- Bug fixes and improvements
-- Performance optimizations
-- Documentation improvements
-
-## License
-
-[Apache 2.0](LICENSE)
-
-## Acknowledgments
-
-- [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language model inference on Apple Silicon
-- [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
-- [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
-- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
-- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
-- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
-- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
-- [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
-- [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
+The oMLX project is distributed under [Apache-2.0](LICENSE). DeepSeek-derived code retains its [MIT license](omlx/patches/deepseek_v41/LICENSE), and MLX-derived native code retains its [Apple MIT notice](omlx/custom_kernels/attention/csrc/MLX_LICENSE.txt). See [third-party notices](docs/deepseek/THIRD_PARTY.md). Model weights are distributed separately under the terms in their Hugging Face repository.

@@ -1911,13 +1911,13 @@ class TestStepBurst:
             engine.close()
 
     def test_empty_token_output_does_not_end_burst(self, mock_model, mock_tokenizer):
-        """A terminal/control output with zero tokens is not a first chunk."""
+        """A nonterminal control output with zero tokens keeps ordinary bursts."""
         engine = self._make_engine(mock_model, mock_tokenizer, max_steps=4)
         try:
             engine.scheduler.step = MagicMock(
                 return_value=SchedulerOutput(
                     has_work=True,
-                    outputs=[RequestOutput(request_id="a", finished=True)],
+                    outputs=[RequestOutput(request_id="a", finished=False)],
                 )
             )
             engine.scheduler.has_requests = MagicMock(return_value=True)

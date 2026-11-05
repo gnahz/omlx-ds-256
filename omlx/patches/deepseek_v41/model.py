@@ -83,6 +83,10 @@ class Model(nn.Module):
             },
         )
 
+    def prefetch_ple(self, next_ids, current_ids):
+        """Scheduler next-chunk notice; starts the Engram row lookahead."""
+        self.language_model.prefetch_ple(next_ids, current_ids)
+
     def close(self):
         closers = []
         offload = getattr(self, "_moe_offload_plan", None)

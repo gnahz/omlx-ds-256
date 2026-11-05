@@ -213,15 +213,77 @@ class Processor:
         return result
 
 
+def prepare_media_messages(messages):
+    """Sort tool results before decoding images so pixels follow prompt order.
+
+    The shared VLM extractor handles flat content arrays. V4.1 places tool
+    images inside nested tool_result blocks, so collect those recursively and
+    pass their sources through the existing decoder and validation policy.
+    """
+    from copy import deepcopy
+
+    from omlx.utils.image import extract_images_from_messages
+
+    from .encoding import _validate_no_image_sp_tokens, merge_tool_messages, sort_tool_results_by_call_order
+
+    def normalize(blocks):
+        for block in blocks:
+            if block.get("type") == "input_text":
+                block["type"] = "text"
+            elif block.get("type") == "input_image":
+                block["type"] = "image_url"
+            elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                normalize(block["content"])
+
+    prepared = deepcopy(messages)
+    for message in prepared:
+        _validate_no_image_sp_tokens(message)
+        for field in ("content", "content_blocks"):
+            if isinstance(message.get(field), list):
+                normalize(message[field])
+    prepared = sort_tool_results_by_call_order(merge_tool_messages(prepared))
+    image_parts = []
+
+    def strip_images(blocks):
+        output = []
+        for block in blocks:
+            kind = block.get("type")
+            if kind in ("image", "image_url"):
+                source = block
+                if kind == "image" and "image" not in block:
+                    url = block.get("url")
+                    record = block.get("source") or {}
+                    if not url and record.get("type") == "base64":
+                        url = f"data:{record['media_type']};base64,{record['data']}"
+                    source = {"type": "image_url", "image_url": {"url": url}}
+                image_parts.append(source)
+            elif kind == "input_audio":
+                raise ValueError("DeepSeek V4.1 supports text and images, not audio")
+            elif kind == "tool_result" and isinstance(block.get("content"), list):
+                block = dict(block, content=strip_images(block["content"]))
+                output.append(block)
+            else:
+                output.append(block)
+        return output
+
+    text_messages = deepcopy(prepared)
+    for message in text_messages:
+        # The official encoder gives content_blocks precedence over content.
+        field = "content_blocks" if "content_blocks" in message else "content"
+        if isinstance(message.get(field), list):
+            message[field] = strip_images(message[field])
+            if isinstance(message.get("content"), list):
+                message["content"] = ""
+    _, images, audio = extract_images_from_messages([{"role": "user", "content": image_parts}])
+    return prepared, text_messages, images, audio
+
+
 def format_messages(messages, num_images):
     """Preserve text/image interleaving, retaining placeholders for decoded PIL inputs."""
     from copy import deepcopy
 
     output, ranges, seen = deepcopy(messages), [], 0
-    for i, message in enumerate(output):
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
+    def replace_images(content):
         count = 0
         for part in content:
             kind = part.get("type")
@@ -231,8 +293,18 @@ def format_messages(messages, num_images):
                 count += 1
             elif kind in ("text", "input_text"):
                 part["type"] = "text"
+            elif kind == "tool_result":
+                if isinstance(part.get("content"), list):
+                    count += replace_images(part["content"])
             else:
                 raise ValueError(f"Unsupported DeepSeek V4.1 content: {kind}")
+        return count
+
+    for i, message in enumerate(output):
+        content = message.get("content_blocks", message.get("content"))
+        if not isinstance(content, list):
+            continue
+        count = replace_images(content)
         if count:
             ranges.append((i, count))
             seen += count

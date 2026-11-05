@@ -420,6 +420,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float | None = None,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
+        prefill_preferred_chunk_tokens: int = 0,
     ):
         """
         Initialize the process memory enforcer.
@@ -448,7 +449,9 @@ class ProcessMemoryEnforcer:
                 default instead.
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
-            prefill_min_chunk_tokens: Floor for adaptive shrink.
+            prefill_min_chunk_tokens: Emergency floor for adaptive shrink.
+            prefill_preferred_chunk_tokens: Preferred performance floor for
+                bounded prefill plans. Zero preserves the legacy policy.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -473,6 +476,7 @@ class ProcessMemoryEnforcer:
         self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._prefill_preferred_chunk_tokens = prefill_preferred_chunk_tokens
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
@@ -1567,6 +1571,7 @@ class ProcessMemoryEnforcer:
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
             scheduler._prefill_min_chunk_tokens = self._prefill_min_chunk_tokens
+            scheduler._prefill_preferred_chunk_tokens = self._prefill_preferred_chunk_tokens
             bg = getattr(scheduler, "batch_generator", None)
             if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                 bg._memory_limit_bytes = soft_limit

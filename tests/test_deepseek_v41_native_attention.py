@@ -18,16 +18,11 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "start,length,pooled_count",
-    [
-        (0, 7, 0),
-        (0, 7, 3),
-        (131, 3, 40),
-        (4096, 7, 1024),
-        # Prefill kernels: direct Q loads, then KV rows decoded once.
-        (0, 16, 3),
-        (131, 300, 40),
-    ],
+    [(0, 1, 0), (0, 2, 1), (131, 2, 40), (4096, 2, 1024),
+     (0, 7, 0), (0, 7, 3), (131, 3, 40), (4096, 7, 1024),
+     (0, 16, 3), (131, 300, 40)],
 )
+
 def test_native_packed_attention_causal_window_and_fp32_sinks(
     start, length, pooled_count
 ):
@@ -65,8 +60,10 @@ def test_native_packed_attention_causal_window_and_fp32_sinks(
         4,
         128,
     )
-    actual = fast.packed_sparse_attention(*args).transpose(0, 2, 1, 3)
-    repeated = fast.packed_sparse_attention(*args).transpose(0, 2, 1, 3)
+    native = (fast.packed_sparse_attention_single_decode if length == 1
+              else fast.packed_sparse_attention)
+    actual = native(*args).transpose(0, 2, 1, 3)
+    repeated = native(*args).transpose(0, 2, 1, 3)
     np.testing.assert_allclose(
         actual.astype(mx.float32), expected.astype(mx.float32), atol=0.008, rtol=0.008
     )
@@ -162,7 +159,7 @@ def test_short_packed_attention_matches_independent_decode(length, pooled_count)
     not nax_sparse_attention_available(), reason="needs M5 tensor units"
 )
 @pytest.mark.parametrize(
-    "start,length,pooled_count", [(0, 16, 3), (131, 300, 40), (4096, 64, 1024)]
+    "start,length,pooled_count", [(0, 256, 3), (131, 300, 40), (4096, 256, 1024)]
 )
 def test_nax_packed_attention_matches_native(start, length, pooled_count):
     """Decoded rows on the tensor units: masked, out-of-range and not yet
@@ -199,15 +196,34 @@ def test_nax_packed_attention_matches_native(start, length, pooled_count):
     not nax_sparse_attention_available(), reason="needs M5 tensor units"
 )
 def test_short_chunk_over_long_context_keeps_the_native_kernel():
-    """The tensor-unit path decodes every pooled row, so a chunk with fewer
-    than one query per 512 pooled rows reads them through the native kernel."""
-    q = mx.zeros((1, 16, 64, 512), mx.bfloat16)
-    window = pack_activation(mx.zeros((1, 16, 512)))
+    """Respect both the minimum query extent and the custom 80 MiB unpack cap."""
     sinks = mx.zeros((64,))
-    ci = mx.zeros((1, 16, 4), mx.int32)
-    for rows, used in ((16 * 512, True), (16 * 512 + 1, False)):
+    max_pooled = 80 * 1024**2 // (512 * 2) - 256
+    for length, rows, used in ((16, 8192, False), (256, max_pooled, True),
+                               (256, max_pooled + 1, False)):
+        q = mx.zeros((1, length, 64, 512), mx.bfloat16)
+        window = pack_activation(mx.zeros((1, length, 512)))
+        ci = mx.zeros((1, length, 4), mx.int32)
         pooled = pack_activation(mx.zeros((1, rows, 512)), 4, 16, True)
         out = nax_packed_sparse_attention(
             q, window, pooled, ci, sinks, 512**-0.5, rows * 4, 4, 128
         )
         assert (out is not None) == used
+        if out is not None:
+            mx.eval(out)
+
+
+@pytest.mark.parametrize("pooled_count", [1, 40, 1024])
+def test_singleton_pooled_attention_keeps_the_fallback_contract(pooled_count):
+    route = fast.deepseek_v41_packed_attention_route(
+        query_tokens=1, batch_size=1, num_heads=64, head_dim=512,
+        is_gpu=True, is_bfloat16=True, local_rows=1, pooled_rows=pooled_count,
+        selected_rows=1, native_decode=True, native_verify=True)
+    assert route is None
+    with pytest.raises(ValueError, match="one query and no pooled rows"):
+        fast.packed_sparse_attention_single_decode(
+            mx.zeros((1, 64, 1, 512), mx.bfloat16),
+            mx.zeros((1, 1, 1, 528), mx.uint8),
+            mx.zeros((1, pooled_count, 288), mx.uint8),
+            mx.zeros((1, 1, 1, 1), mx.uint32), mx.zeros((64,)),
+            512**-0.5, 0, 4, 128)

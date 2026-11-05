@@ -9,7 +9,7 @@ import numpy as np
 
 from .gemv import mxfp8_gemv_each
 from .quantization import QuantizedProjection, quantize_activation
-from .storage import dedupe_tuple_ids
+from .storage import DiskEngramEmbedding, dedupe_tuple_ids
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -166,7 +166,12 @@ class Engram(nn.Module):
     def __call__(self, h, ids, image_mask=None):
         c = self._config
         ids_np = np.asarray(ids, dtype=np.int64)
-        ids_host, inverse = dedupe_tuple_ids(ids_np)
+        # Disk lookahead windows are keyed by token position, including repeated
+        # tuples and scheduler-shortened chunks. Its raw reader deduplicates I/O.
+        if isinstance(self.embed, DiskEngramEmbedding) and self.embed._resident is None:
+            ids_host, inverse = ids_np, None
+        else:
+            ids_host, inverse = dedupe_tuple_ids(ids_np)
         rows = self.embed(mx.array(ids_host)).flatten(-2)
         count = math.prod(ids_np.shape[:-1]) if ids_np.ndim >= 2 else 1
         if 1 < count <= _ROWWISE_ROWS:

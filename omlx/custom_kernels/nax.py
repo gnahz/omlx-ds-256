@@ -6,6 +6,9 @@ extension's mirror of mlx metal::is_nax_available() and falls back to parsing
 mx.device_info() when the extension is missing.
 """
 
-from omlx.custom_kernels.quant_matmul.fast import is_nax_available
+from omlx.custom_kernels.quant_matmul.fast import (
+    is_nax_available,
+    is_nax_hardware_available,
+)
 
-__all__ = ["is_nax_available"]
+__all__ = ["is_nax_available", "is_nax_hardware_available"]

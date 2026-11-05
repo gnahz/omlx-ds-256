@@ -9,11 +9,20 @@ compiled extension is required; compilation/dispatch errors propagate.
 """
 
 from functools import cache
+import os
 
 import mlx.core as mx
 
 from ..glm_moe_dsa.indexer_nax import indexer_scores_nax, nax_indexer_available
 from .packed_attention import rounded_packed_attention
+from . import attn_fusions, decode_topk, workspace as _workspace
+
+DS41_PREFILL_INDEX = int(os.environ.get("DS41_PREFILL_INDEX", "2"))
+DS41_INDEX_ROWS = os.environ.get("DS41_INDEX_ROWS", "1") == "1"
+DS41_DECODE_SINGLE_TILE = os.environ.get("DS41_DECODE_SINGLE_TILE", "1") == "1"
+DS41_DECODE_RADIX = os.environ.get("DS41_DECODE_RADIX", "1") == "1"
+DS41_PREFILL_MID_INDEX = os.environ.get("DS41_PREFILL_MID_INDEX", "1") == "1"
+PREFILL_INDEX_IMPLEMENTATION = "stable_reference_radix"
 
 _HEADER = r"""
 #include <metal_stdlib>
@@ -326,6 +335,79 @@ _MERGE = r"""
 """
 
 
+# Reuse each decoded key tile across short rows, with stable 1017 rounding
+# after QK, after relu*weight and after the FP32 cross-head reduction.
+_INDEX_MMA_ROWS = r"""
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = tid % 32, sg = tid / 32;
+    const uint block = threadgroup_position_in_grid.x * 32;
+    const int H = HEADS, N = meta[1], M = meta[2], start = meta[3], ratio = RATIO;
+    const int L = meta[6];
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    threadgroup float tile[D * 32];
+    for (uint i = tid; i < 32 * (D / 8); i += 128) {
+        const uint col = i / (D / 8), word = i % (D / 8);
+        const int row = int(block + col);
+        if (row < N) {
+            const size_t base = size_t(row) * (D / 2 + D / 32);
+            const uint bits = *((const device uint*)(keys + base) + word);
+            const int e = int(keys[base + D / 2 + word / 4]);
+            const bool fast = e >= 3 && e <= 254;
+            const float scale = as_type<float>(uint(e) << 23);
+            for (uint k = 0; k < 8; ++k) {
+                const float x = v41_fp4((bits >> (4 * k)) & 15);
+                tile[(word * 8 + k) * 32 + col] = fast ? x * scale : ldexp(x, e - 127);
+            }
+        } else {
+            for (uint k = 0; k < 8; ++k) tile[(word * 8 + k) * 32 + col] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint col = sg * 8 + fn;
+    float2 key[D / 8];
+    for (uint s = 0; s < D / 8; ++s)
+        key[s] = float2(tile[(s * 8 + fm) * 32 + col], tile[(s * 8 + fm) * 32 + col + 1]);
+    for (int query = 0; query < L; ++query) {
+        float2 first = 0.0f, second = 0.0f;
+        for (int hb = 0; hb < 4; ++hb) {
+            const int h = hb == 0 ? 0 : (hb == 1 ? 16 : (hb == 2 ? 8 : 24));
+            simdgroup_matrix<float, 8, 8> acc, a, b;
+            acc.thread_elements()[0] = 0.0f;
+            acc.thread_elements()[1] = 0.0f;
+            auto qrow = q + (size_t(query) * H + h + fm) * D + fn;
+            #pragma clang loop unroll(full)
+            for (uint s = 0; s < D / 8; ++s) {
+                a.thread_elements()[0] = float(qrow[s * 8]);
+                a.thread_elements()[1] = float(qrow[s * 8 + 1]);
+                b.thread_elements()[0] = key[s].x;
+                b.thread_elements()[1] = key[s].y;
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            const float weight = weights[query * H + h + fm];
+            float v0 = float(R(max(float(R(acc.thread_elements()[0])), 0.0f) * weight));
+            float v1 = float(R(max(float(R(acc.thread_elements()[1])), 0.0f) * weight));
+            for (uint i = 0; i < 3; ++i) {
+                const uint mask = i == 0 ? 2 : (i == 1 ? 4 : 16);
+                v0 += simd_shuffle_xor(v0, mask);
+                v1 += simd_shuffle_xor(v1, mask);
+            }
+            if (hb < 2) { first.x += v0; first.y += v1; }
+            else { second.x += v0; second.y += v1; }
+        }
+        if (fm == 0) {
+            const int limit = (start + query + 1) / ratio;
+            for (uint j = 0; j < 2; ++j) {
+                const uint pos = block + col + j;
+                if (pos >= uint(M)) continue;
+                const bool valid = int(pos) < N && int(pos) + meta[5] < limit;
+                scores[size_t(query) * M + pos] = valid ? float(R(first[j] + second[j])) : -INFINITY;
+            }
+        }
+    }
+"""
+
+
 @cache
 def _kernel(kind):
     if kind in ("attention", "attention_mma"):
@@ -337,6 +419,9 @@ def _kernel(kind):
     elif kind == "merge":
         inputs = ["partial", "sink", "meta"]
         outputs, source = ["out"], _MERGE
+    elif kind == "index_mma_rows":
+        inputs = ["q", "keys", "weights", "meta"]
+        outputs, source = ["scores"], _INDEX_MMA_ROWS
     else:
         inputs = ["q", "keys", "weights", "candidates", "meta"]
         outputs, source = ["scores"], _INDEX_MMA if kind == "index_mma" else _INDEX
@@ -349,8 +434,8 @@ def _kernel(kind):
     )
 
 
-def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
-    """Read packed rows directly; scratch scales with split count, not selected D."""
+def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale, rope_tables=None):
+    """Read packed rows, retaining stable BF16 PV rounding before optional output RoPE."""
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] % 32:
         raise ValueError("Prepare one request with 32-aligned attention heads")
     _, length, heads, dim = q.shape
@@ -364,8 +449,23 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
         raise ValueError("Expected packed uint8 KV")
     if window.shape[-1] != dim + dim // 32 or pooled.shape[-1] != dim // 2 + dim // 16:
         raise ValueError("Invalid packed KV row width")
+
+    def rotated(out):
+        if rope_tables is None:
+            return out
+        from . import fast_rope
+        cos, sin, rope_dim = rope_tables
+        if (not 0 < rope_dim <= dim or rope_dim % 2
+                or cos.shape != (length, rope_dim // 2) or sin.shape != cos.shape):
+            raise ValueError("Output RoPE tables must match the attention rows")
+        if fast_rope.supported_length(out, length, rope_dim):
+            return fast_rope.partial_rope(out, cos, sin, rope_dim)
+        # Keep CPU diagnostics on the stable reference arithmetic as well.
+        from .language import _rope_apply
+        return _rope_apply(out, cos, sin, False)
+
     if q.dtype == mx.bfloat16:
-        return rounded_packed_attention(q, window, pooled, wi, ci, sink, scale)
+        return rotated(rounded_packed_attention(q, window, pooled, wi, ci, sink, scale))
 
     # Short verification blocks share the decode reduction and split geometry.
     # Each query owns its causal indices while all rows share one dispatch.
@@ -399,7 +499,7 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
         output_shapes=[(1, length, heads, splits, dim + 2)],
         output_dtypes=[mx.float32],
     )[0]
-    return _kernel("merge")(
+    result = _kernel("merge")(
         inputs=[partial, sink, mx.array([heads, splits], mx.int32)],
         template=[("D", dim), ("T", q.dtype)],
         grid=((heads + 3) // 4 * 128, length, 1),
@@ -407,6 +507,7 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
         output_shapes=[q.shape],
         output_dtypes=[q.dtype],
     )[0]
+    return rotated(result)
 
 
 # One thread per value: 64 FP4 code bytes, then 4 power-of-two scale bytes.
@@ -481,6 +582,32 @@ def packed_index_scores(
         raise ValueError("Invalid packed index row width")
     if not width:
         return mx.zeros((1, length, 0), mx.float32)
+    if (
+        DS41_INDEX_ROWS
+        and candidates is None
+        # CED midpoint batches use the same per-row reductions as verify.
+        # Keep their key tile in registers across the bounded 128-query tail.
+        and 2 <= length <= (128 if DS41_PREFILL_MID_INDEX else 8)
+        and heads == 32
+        and dim == 128
+        and q.dtype == mx.bfloat16
+    ):
+        return _kernel("index_mma_rows")(
+            inputs=[
+                q,
+                keys,
+                weights.astype(mx.float32),
+                mx.array(
+                    [heads, keys.shape[1], width, start, ratio, key_start, length],
+                    mx.int32,
+                ),
+            ],
+            template=[("D", dim), ("HEADS", heads), ("RATIO", ratio), ("R", q.dtype)],
+            grid=((width + 31) // 32 * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(1, length, width)],
+            output_dtypes=[mx.float32],
+        )[0]
     if (
         candidates is None
         and dim == 128
@@ -1087,12 +1214,31 @@ def index_select(scores, count, candidates=None):
     )[0]
 
 
+def index_radix_query_group(key_tokens):
+    return _workspace.index_radix_query_group(key_tokens)
+
+
+def index_scan_plan(length, width, *, block_count=0, block_size=0,
+                    query_chunk_size=None, chunk_size=None):
+    return _workspace.index_scan_plan(
+        length, width, block_count=block_count, block_size=block_size,
+        query_chunk_size=query_chunk_size, chunk_size=chunk_size,
+        mid_index=DS41_PREFILL_MID_INDEX, decode_single_tile=DS41_DECODE_SINGLE_TILE)
+
+
+def packed_index_workspace_bytes(query_tokens, key_tokens, count, *,
+                                 block_count=0, block_size=0):
+    # Worst-case midpoint enablement bounds both actual flag states.
+    return _workspace.packed_index_workspace_bytes(
+        query_tokens, key_tokens, count, block_count=block_count, block_size=block_size)
+
+
 def _radix_index_topk(
     q, keys, weights, start, ratio, count, block_count=0, block_size=0
 ):
     """Score bounded query groups, then select with the radix kernel."""
     # At most 64 MiB of FP32 scores per group.
-    group = min(1024, max(1, (64 << 20) // (4 * keys.shape[1])))
+    group = index_radix_query_group(keys.shape[1])
     results, block_results, pending = [], [], ()
     for begin in range(0, q.shape[1], group):
         end = min(begin + group, q.shape[1])
@@ -1148,21 +1294,11 @@ def packed_index_topk(
     submitting another, and the final batch is drained before returning.
     Returns chronological IDs, with -1 padding.
     """
-    if query_chunk_size is None:
-        # Fill the score budget with queries when the key prefix is short.
-        # A fixed 16-query tile creates many unnecessary submission barriers.
-        query_chunk_size = min(512, max(16, 1048576 // max(1, keys.shape[1])))
-    if count < 0 or block_count < 0 or query_chunk_size <= 0:
+    if count < 0:
         raise ValueError("Invalid index selection budget")
-    if chunk_size is None:
-        chunk_size = min(
-            524288 if q.shape[1] == 1 else 262144,
-            1048576 // max(1, min(q.shape[1], query_chunk_size)),
-        )
-    if chunk_size <= 0:
-        raise ValueError("Invalid index selection budget")
-    if block_count and block_size <= 0:
-        raise ValueError("Candidate block size must be positive")
+    query_chunk_size, chunk_size = index_scan_plan(
+        q.shape[1], keys.shape[1], block_count=block_count, block_size=block_size,
+        query_chunk_size=query_chunk_size, chunk_size=chunk_size)
     # Validate even an empty source through the scoring entry point.
     packed_index_scores(q, keys[:, :0], weights, start, ratio)
     width = keys.shape[1]
@@ -1200,6 +1336,7 @@ def packed_index_topk(
             mx.full((1, end - begin, block_count), 2147483647, mx.int32),
         )
         visible = min(width, (start + end) // ratio)
+        selected = block_selected = None
         for first in range(0, visible, chunk_size):
             stop = min(first + chunk_size, visible)
             scores = packed_index_scores(
@@ -1210,9 +1347,21 @@ def packed_index_topk(
                 ratio,
                 key_start=first,
             )
-            if single_tile and q.shape[1] <= 8:
-                # Decode and verify rows: one selection kernel, already in the final form.
-                running = None
+            select = single_tile and q.shape[1] <= 8 and attn_fusions.DECODE_SELECT
+            if select and attn_fusions.select_supported(scores.shape[-1], count):
+                # Decode/verify rows: one-kernel exact selection of the same
+                # ids (score desc, id asc) as the tile sort + rank merges.
+                selected = attn_fusions.select_rows(scores, count, offset=first)
+            elif (
+                DS41_DECODE_RADIX
+                and single_tile
+                and q.shape[1] <= 8
+                and scores.shape[-1] >= max(count, 32768)
+            ):
+                # Decode/verify rows: exact multi-threadgroup radix selection
+                # of the same ids (score desc, id asc) as the tile sort.
+                selected = decode_topk.selection(scores, count)
+            elif single_tile and q.shape[1] <= 8:
                 selected = index_select(scores, count)
             else:
                 values, ids = _tile_topk(scores, count, offset=first)
@@ -1221,7 +1370,19 @@ def packed_index_topk(
                     if first == 0 and values.shape[-1] == count
                     else _merge_topk(running, (values, ids), count)
                 )
-            if block_count:
+            if block_count and select and attn_fusions.select_supported(
+                (scores.shape[-1] + block_size - 1) // block_size, block_count
+            ):
+                block_selected = attn_fusions.select_rows(
+                    scores,
+                    block_count,
+                    offset=first // block_size,
+                    block_size=block_size,
+                    force_latest=True,
+                    start=start + begin,
+                    ratio=ratio,
+                )
+            elif block_count:
                 values, ids = _tile_topk(
                     scores,
                     block_count,
@@ -1247,11 +1408,13 @@ def packed_index_topk(
                 mx.async_eval(*pending)
         results.append(
             selected
-            if running is None
+            if selected is not None
             else mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
         )
         block_results.append(
-            mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)
+            block_selected
+            if block_selected is not None
+            else mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)
         )
     if pending:
         mx.eval(*pending)

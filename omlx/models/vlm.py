@@ -574,6 +574,12 @@ class VLMModelAdapter(nn.Module):
         """Whether the language model gathers PLE rows one prefill chunk ahead."""
         probe = getattr(self._language_model, "ple_gathers_ahead", None)
         return bool(probe()) if probe is not None else False
+    @property
+    def _omlx_exact_prefix_cache(self):
+        if self.model_type != "deepseek_v41":
+            return None
+        from ..patches.deepseek_v41.prefix_cache import for_model
+        return for_model(self._language_model)
 
     def bind_prefill_prompt_ids(self, prompt_ids: Optional[List[int]]) -> None:
         """Bind the full prompt ids of the request whose prefill call runs next.

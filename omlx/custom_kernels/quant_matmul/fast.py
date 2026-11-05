@@ -167,6 +167,17 @@ def _stock_mlx_has_nax(lib_path: Path | None = None) -> bool:
     return found
 
 
+def is_nax_hardware_available() -> bool:
+    """Whether this GPU/OS supports tensor units, independently of MLX's library.
+
+    Custom JIT kernels bring their own MPP code and do not require stock MLX
+    NAX symbols in the installed metallib.
+    """
+    if _EXT_HAS_NAX:
+        return bool(_ext.is_nax_available())
+    return _nax_available_fallback()
+
+
 def is_nax_available() -> bool:
     """True when stock MLX will dispatch to the M5 tensor-unit (NAX) kernels.
 
@@ -175,10 +186,7 @@ def is_nax_available() -> bool:
     """
     global _nax_available_cache
     if _nax_available_cache is None:
-        if _EXT_HAS_NAX:
-            hardware = bool(_ext.is_nax_available())
-        else:
-            hardware = _nax_available_fallback()
+        hardware = is_nax_hardware_available()
         _nax_available_cache = hardware and _stock_mlx_has_nax()
     return _nax_available_cache
 
@@ -734,3 +742,15 @@ def __dir__() -> list[str]:
     if _ext is not None:
         names.update(dir(_ext))
     return sorted(names)
+
+
+def deepseek_v41_joint_metadata_gather_qmm(
+    x, weight, joint_words, joint_dictionary, lhs_indices, rhs_indices, *, stream=None
+):
+    """Project original LSQ3 codes using exact G128 metadata dictionaries."""
+    if _ext is None or not hasattr(_ext, "deepseek_v41_joint_metadata_gather_qmm"):
+        raise RuntimeError("DeepSeek joint-metadata NAX kernel is unavailable")
+    return _ext.deepseek_v41_joint_metadata_gather_qmm(
+        x, weight, joint_words, joint_dictionary, lhs_indices, rhs_indices,
+        **_native_stream_kwargs(stream)
+    )

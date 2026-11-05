@@ -256,6 +256,9 @@ class QuantizedProjection(QuantizedSwitchLinear):
         """Project an input whose activation quantization is already complete."""
         if indices is None:
             if self.mode == "mxfp8":
+                from . import fast_qmv
+                if fast_qmv.supported(self, x):
+                    return fast_qmv.mxfp8_qmv(x, self.weight, self.scales)
                 y = mxfp8_gemv(x, self.weight, self.scales)
                 if y is not None:
                     return y
@@ -270,4 +273,42 @@ class QuantizedProjection(QuantizedSwitchLinear):
             )
         return super().__call__(
             x, indices, sorted_indices=sorted_indices, block_plan=block_plan
+        )
+
+
+@mx.compile
+def _quantize_attention_output(x):
+    grouped = x.astype(mx.float32).reshape(*x.shape[:-1], -1, 32)
+    amax = mx.maximum(mx.max(mx.abs(grouped), axis=-1, keepdims=True), 1e-4)
+    bits = (amax * mx.array(1 / 448, mx.float32)).view(mx.uint32)
+    exponent = ((bits >> 23) & 255).astype(mx.int32) - 127 + ((bits & 0x7fffff) != 0)
+    scale = _normal_power_of_two(exponent)
+    scaled = mx.clip(grouped / scale, -448.0, 448.0)
+    rounded = mx.abs(round_fp8(scaled))
+    rounded = mx.where((scaled.view(mx.uint32) >> 31) != 0, -rounded, rounded)
+    return (rounded * scale).reshape(x.shape).astype(x.dtype)
+
+
+def quantize_attention_output(x):
+    """Stable 1017 output activation, preserving negative-zero bits."""
+    if x.shape[-1] % 32 or x.dtype not in (mx.float32, mx.float16, mx.bfloat16):
+        raise ValueError("Attention output requires 32-aligned floating point heads")
+    if not x.size:
+        return x
+    if mx.default_device() == mx.gpu:
+        return quantize_fp8_activation(x, preserve_zero_sign=True)
+    return _quantize_attention_output(x)
+
+
+class QuantizedEmbedding(QuantizedProjection):
+    """Gather only requested affine rows; never expand the vocabulary tensor."""
+
+    def __call__(self, indices):
+        if self.mode != "affine" or self.quantize_input:
+            raise ValueError(
+                "Quantized embedding requires affine weights without activation quantization"
+            )
+        return mx.dequantize(
+            self.weight[indices], self.scales[indices], self.biases[indices],
+            group_size=self.group_size, bits=self.bits, mode=self.mode,
         )

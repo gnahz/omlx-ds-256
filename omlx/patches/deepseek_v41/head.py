@@ -44,6 +44,25 @@ def _kernel():
 
 def project_logits(x, weight):
     """Keep the full logits contract for prefill and multi-token verification."""
+    if hasattr(weight, "weight"):
+        if hasattr(weight, "bits"):
+            if getattr(weight, "quantize_input", False):
+                raise ValueError("Vocabulary head must not quantize activations")
+            # Vocabulary logits use the original FP32 affine arithmetic. The
+            # packed codes stay resident; no dense vocabulary is materialized.
+            affine = weight.mode == "affine"
+            scales = weight.scales.astype(mx.float32) if affine else weight.scales
+            biases = weight.get("biases")
+            if biases is not None and affine:
+                biases = biases.astype(mx.float32)
+            return mx.quantized_matmul(
+                x.astype(mx.float32), weight.weight, scales, biases,
+                transpose=True, group_size=weight.group_size,
+                bits=weight.bits, mode=weight.mode,
+            )
+        weight = weight.weight
+    if weight.dtype == mx.uint32:
+        raise ValueError("Packed vocabulary weights require projection metadata")
     rows, width = weight.shape
     if (
         weight.dtype != mx.bfloat16

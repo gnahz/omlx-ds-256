@@ -15,17 +15,19 @@ copies instead. Replacing, slicing or extracting a slot outside this module
 breaks the chain; the next append then starts a new buffer from the prefix.
 """
 
+import os
 import mlx.core as mx
+
+ENABLED = os.environ.get("DS41_GROWTH", "1") == "1"
+PINGPONG = True
+PINGPONG_ROWS = 64
 
 # Longer appends (prefill chunks) allocate one exact buffer, so prefill memory
 # is unchanged.
 _MAX_ROWS = 64
 
 
-def _capacity(end, rows):
-    if rows > _MAX_ROWS:
-        return (max(end, 256) + 255) // 256 * 256
-    return (end + max(4096, end // 16) + 255) // 256 * 256
+from ...kv_capacity import growth_capacity as _capacity
 
 
 def _registry(cache):
@@ -37,6 +39,8 @@ def _registry(cache):
 
 def append(cache, slot, previous, values, start):
     """Return ``previous[:, :start]`` followed by ``values`` as a buffer view."""
+    if not ENABLED:
+        return mx.concatenate([previous[:, :start], values], 1)
     buffers = _registry(cache)
     entry = buffers.get(slot)
     chain = (

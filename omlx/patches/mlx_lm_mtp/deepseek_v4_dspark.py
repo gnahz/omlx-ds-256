@@ -171,16 +171,21 @@ def _capture_prompt(host, inputs, aux_hidden, target_cache):
         return
     seq_len = int(inputs.shape[1])
     start_offset = offset_after - seq_len
-    ctx = getattr(host, _PRIME_CTX_ATTR, None)
+    owner = (
+        target_cache[0]
+        if getattr(host, "_omlx_dspark_cache_owned", False) and target_cache
+        else host
+    )
+    ctx = getattr(owner, _PRIME_CTX_ATTR, None)
     if not isinstance(ctx, _DSparkPrimeContext) or (
         ctx.expected_target_offset != start_offset
     ):
-        drop_primed(host)
+        drop_primed(owner)
         ctx = _DSparkPrimeContext(
             caches=host.make_mtp_cache(),
             expected_target_offset=start_offset,
         )
-        setattr(host, _PRIME_CTX_ATTR, ctx)
+        setattr(owner, _PRIME_CTX_ATTR, ctx)
     try:
         host.dspark_append_context(
             aux_hidden,
@@ -188,7 +193,7 @@ def _capture_prompt(host, inputs, aux_hidden, target_cache):
             start_offset=start_offset,
         )
     except Exception:
-        drop_primed(host)
+        drop_primed(owner)
         logger.debug("DeepSeek DSpark prompt capture failed", exc_info=True)
         return
     ctx.expected_target_offset = offset_after
@@ -206,8 +211,13 @@ def take_primed(
     _main_token: Any,
 ) -> Optional[tuple[list[DSparkContextCache], int]]:
     """Finish the prompt-to-decode seam for the native MTP batch loop."""
-    ctx = getattr(host, _PRIME_CTX_ATTR, None)
-    drop_primed(host)
+    owner = (
+        target_cache[0]
+        if getattr(host, "_omlx_dspark_cache_owned", False) and target_cache
+        else host
+    )
+    ctx = getattr(owner, _PRIME_CTX_ATTR, None)
+    drop_primed(owner)
     if not isinstance(ctx, _DSparkPrimeContext):
         return None
     target_offset = _target_cache_offset(target_cache)

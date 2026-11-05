@@ -2,6 +2,8 @@
 """Request-local V4.1 DSML framing with opaque reasoning content."""
 
 from contextlib import suppress
+import copy
+import os
 
 from ...adapter.output_parser import (
     OutputParserFinalizeResult,
@@ -12,10 +14,35 @@ from ...adapter.output_parser import (
 from .tool_parser import parse_tool_call, tool_call_end, tool_call_start
 
 
+# Streaming detokenizers whose constructor only derives read-only data from the tokenizer (the
+# 129K-entry token map: ~25-45 ms of convert_ids_to_tokens on the engine thread, paid by every
+# request's first token) and whose reset() drops all streaming state (mlx-lm's documented contract).
+# One template per tokenizer; each session gets a shallow copy (shared token map) after reset().
+_TEMPLATE_KINDS = {("mlx_lm.tokenizer_utils", "BPEStreamingDetokenizer"),
+                   ("mlx_lm.tokenizer_utils", "SPMStreamingDetokenizer")}
+_TEMPLATES = {}
+REUSE = os.environ.get("DS41_DETOK_REUSE", "1") == "1"
+
+
+def _fresh_detokenizer(tokenizer, model_path):
+    if not REUSE:
+        return create_streaming_detokenizer(tokenizer, model_path)
+    key = (id(tokenizer), str(model_path))
+    entry = _TEMPLATES.get(key)
+    if entry is None or entry[0] is not tokenizer:
+        template = create_streaming_detokenizer(tokenizer, model_path)
+        if template is None or (type(template).__module__, type(template).__name__) not in _TEMPLATE_KINDS:
+            return template
+        entry = _TEMPLATES[key] = (tokenizer, template)
+    detokenizer = copy.copy(entry[1])
+    detokenizer.reset()
+    return detokenizer
+
+
 class DeepSeekV41OutputParserSession:
     def __init__(self, tokenizer, model_path=None):
         self._tokenizer = tokenizer
-        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
+        self._detokenizer = _fresh_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
             self._detokenizer.reset()
         self._buffer = ""

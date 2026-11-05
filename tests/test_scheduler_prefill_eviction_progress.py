@@ -96,6 +96,7 @@ def test_external_prefill_resumes_without_replaying_tokens(
         )
         assert exc.value.request.reason == expected_reason
         assert request.cached_tokens == pause_at
+        assert request.api_cached_tokens == cached_tokens
         assert request.remaining_tokens == prompt[pause_at:]
         if pause_at:
             assert request.prompt_cache[0].offset == pause_at
@@ -110,6 +111,7 @@ def test_external_prefill_resumes_without_replaying_tokens(
         request, request.remaining_tokens, request.prompt_cache
     )
     assert last_token == prompt[-1:]
+    assert request.api_cached_tokens == cached_tokens
     assert cache[0].offset == len(prompt) - 1
     model(mx.array(last_token)[None], cache=cache)
     assert model.seen == prompt

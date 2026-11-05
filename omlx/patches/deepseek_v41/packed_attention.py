@@ -251,7 +251,10 @@ def nax_packed_sparse_attention(q, window, pooled, ci, sink, scale, start, ratio
     """
     if (
         not nax_sparse_attention_available()
-        or q.shape[1] < NAX_MIN_ROWS
+        or q.shape[1] < max(NAX_MIN_ROWS, 256)
+        # Match the native workspace admission contract. Long-context chunks
+        # that cannot unpack within 80 MiB retain the packed-row kernel.
+        or (window.shape[1] + max(pooled.shape[1], 1)) * 512 * 2 > 80 * 1024**2
         or window.shape[-1] != 528
         or pooled.shape[-1] != 288
         or not pooled.shape[1]

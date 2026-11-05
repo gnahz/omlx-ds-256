@@ -27,6 +27,17 @@ _ROUND = _SCALE + r"""
     if (i < n) y[i] = T(q * scale);
 """
 
+# Attention's published in-place FP8 conversion preserves negative zero. Keep
+# the sign as integer bits until after the magnitude arithmetic so Metal's
+# fast-math sign()/zero simplifications cannot discard it. Other activation
+# paths deliberately retain their existing sign semantics.
+_ROUND_SIGNED_ZERO = _SCALE + r"""
+    const float magnitude = min(rint(a / step) * step, 448.0f) * scale;
+    const uint sign_bit = as_type<uint>(v) & 0x80000000u;
+    const float rounded = as_type<float>(as_type<uint>(magnitude) | sign_bit);
+    if (i < n) y[i] = T(rounded);
+"""
+
 # MLX to_fp8 (E4M3FN) bit conversion; q is already on the FP8 grid.
 _FP8_HEADER = r"""
 inline uchar v41_fp8_bits(float f) {
@@ -94,7 +105,7 @@ _TAIL_SOURCE = r"""
 
 
 @cache
-def _kernel(tail=False, paired=False):
+def _kernel(tail=False, paired=False, preserve_zero_sign=False):
     if paired:
         return mx.fast.metal_kernel(
             name="v41_paired_swiglu_fp8_activation",
@@ -109,16 +120,23 @@ def _kernel(tail=False, paired=False):
                 "float g = pair[j], u = pair[j + D];",
             ),
         )
+    source = _TAIL_SOURCE if tail else _SOURCE
+    name = "v41_swiglu_fp8_activation" if tail else "v41_fp8_activation"
+    if preserve_zero_sign:
+        if tail:
+            raise ValueError("Signed-zero mode is only for attention activations")
+        source = source.replace(_ROUND, _ROUND_SIGNED_ZERO)
+        name = "v41_fp8_activation_signed_zero"
     return mx.fast.metal_kernel(
-        name="v41_swiglu_fp8_activation" if tail else "v41_fp8_activation",
+        name=name,
         input_names=["gate", "up", "weights", "limit"] if tail else ["x"],
         output_names=["y"],
-        source=_TAIL_SOURCE if tail else _SOURCE,
+        source=source,
     )
 
 
-def quantize_fp8_activation(x):
-    return _kernel()(
+def quantize_fp8_activation(x, *, preserve_zero_sign=False):
+    return _kernel(preserve_zero_sign=preserve_zero_sign)(
         inputs=[x],
         template=[("T", x.dtype)],
         grid=(x.size, 1, 1),

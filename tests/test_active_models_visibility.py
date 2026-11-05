@@ -44,6 +44,7 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
         generation_started_at=100.0,
         last_activity_at=109.5,
         num_output_tokens=20,
+        recent_decode_tokens_per_second=lambda now: 0.0 if now == 110.0 else None,
         num_prompt_tokens=12,
         max_tokens=64,
     )
@@ -91,11 +92,64 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
             "elapsed_seconds": 10.0,
             "generated_tokens": 20,
             "tokens_per_second": 2.0,
+            "recent_tokens_per_second": 0.0,
             "last_activity_age_seconds": 0.5,
             "prompt_tokens": 12,
             "max_tokens": 64,
         }
     ]
+
+
+def test_preparation_handoff_and_live_prefill_take_priority_over_stale_rows():
+    # The abbreviated IDs all match. Only full-ID collisions are removed.
+    prep_id = "12345678-preparing"
+    running_id = "12345678-generating"
+    waiting_id = "12345678-waiting"
+    prefill_id = "12345678-prefilling"
+    preparation_rows = [
+        {"request_id": request_id, "kind": "request_preparation", "phase": "preparing_request"}
+        for request_id in (prep_id, running_id, waiting_id, prefill_id)
+    ]
+    scheduler = SimpleNamespace(
+        snapshot_for_admin=lambda: {
+            "running_by_id": {
+                running_id: SimpleNamespace(request_id=running_id),
+            },
+            "waiting": [
+                SimpleNamespace(request_id=request_id, arrival_time=100.0)
+                for request_id in (prefill_id, running_id, waiting_id)
+            ],
+        },
+    )
+    prep_tracker = SimpleNamespace(get_model_activities=lambda model_id: preparation_rows)
+    prefill_tracker = SimpleNamespace(
+        get_model_progress=lambda model_id: [{"request_id": prefill_id}],
+    )
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=FakePool(scheduler)),
+        patch.object(admin_routes, "_get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=prefill_tracker),
+        patch(
+            "omlx.request_preparation.get_request_preparation_tracker",
+            return_value=prep_tracker,
+        ),
+        patch("time.monotonic", return_value=110.0),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == model["active_requests"] == 3
+    assert data["total_waiting_requests"] == model["waiting_requests"] == 1
+    assert [(r["request_id"], r["queue_position"]) for r in model["waiting"]] == [
+        (waiting_id, 1),
+    ]
+    assert [r["request_id"] for r in model["prefilling"]] == [prefill_id]
+    assert [r["request_id"] for r in model["generating"]] == [running_id]
+    assert model["generating"][0]["recent_tokens_per_second"] is None
+    assert [r["request_id"] for r in model["activities"]] == [prep_id]
 
 
 def test_active_models_does_not_count_waiting_collectors_as_active():
@@ -620,3 +674,25 @@ def test_active_models_resolves_scheduler_property_without_async_core():
     assert model["active_requests"] == 1
     assert model["generating"][0]["request_id"] == "gen-1"
     assert model["activities"] == []
+
+
+def test_scheduler_budget_is_not_overwritten_by_engine_activity_snapshot():
+    budget = {"current_bytes": 232 * 1024**3, "reserved_bytes": 2 * 1024**3,
+              "limit_bytes": 238 * 1024**3, "pending": {"request_id": "old"}}
+    scheduler = SimpleNamespace(snapshot_for_admin=lambda: {
+        "running_by_id": {}, "waiting": [], "memory_budget": budget,
+    })
+    pool = FakePool(scheduler)
+    pool._entries["model-a"].engine.get_activity_snapshot = lambda: {
+        "activities": [], "memory_budget": {},
+    }
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_server_state", return_value=None),
+        patch.object(admin_routes, "_get_settings_manager", return_value=None),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=SimpleNamespace(
+            get_model_progress=lambda model_id: [])),
+    ):
+        data = admin_routes._build_active_models_data()
+    assert data["models"][0]["memory_budget"] == budget

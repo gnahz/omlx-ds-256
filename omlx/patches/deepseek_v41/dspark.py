@@ -6,14 +6,120 @@ never enter that ring. Server acceptance/rollback is a separate integration.
 """
 
 from dataclasses import replace
+import json
+import os
+import time
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..mlx_lm_mtp.deepseek_v4_dspark import DSparkContextCache
 from .head import project_logits
+from . import attn_out, decode_fusions, woa_compact
 from .language import Attention, Block, RMSNorm, hc_mixes, hc_post, hc_pre, rope
 from .quantization import quantize_activation
+
+
+DRAFT_ASYNC = os.environ.get("DS41_DRAFT_ASYNC", "1") == "1"
+# DS41_DRAFT_HEAD=mxfp8 (opt-in; default bf16, any other value = bf16): draft
+# logits of cost-policy blocks (the caller's hist_offset >= 1024) come from an
+# MXFP8 copy of the BF16 vocabulary head (half the bytes), quantized once at
+# load (install_draft_head), through og_fused's fast_qmv rows kernel in both
+# proposal_forward and proposal_forward_batch. That kernel's per-row arithmetic
+# does not depend on the row count, so a request's drafts are bitwise the same
+# alone or batched. Blocks below 1024 tokens keep the BF16 head: there the draft
+# pattern reaches T=0 text (acceptance-only depth, width-dependent index layout).
+# Drafts only steer speculation; verified tokens never change.
+DRAFT_HEAD = os.environ.get("DS41_DRAFT_HEAD", "bf16")
+_MAX_BATCH_ROWS = 8  # the short-row mHC / MoE / combine paths a width<=4 block already takes
+STATS = {}  # draft_head_* counters; og_model.load binds them into og_model.STATS (/og/stats)
+
+
+def bind(stats):
+    global STATS
+    STATS = stats
+    for key in ("draft_head_mxfp8", "draft_head_mxfp8_rows", "draft_head_bf16_rows"):
+        stats.setdefault(key, 0)
+
+
+def _count(kind, rows):
+    key = f"draft_head_{kind}_rows"
+    STATS[key] = STATS.get(key, 0) + rows
+
+
+def _head_ok(model):
+    head = model.head
+    w = getattr(head, "weight", None)
+    return (
+        w is not None
+        and not hasattr(head, "bits")
+        and w.dtype == mx.bfloat16
+        and w.ndim == 2
+        and w.shape[1] % 32 == 0
+        and w.shape[1] not in (64, 128)
+    )
+
+
+def use_mxfp8(model, cost_policy):
+    """Whether the MXFP8 head serves a block (one answer for single and batched drafting)."""
+    return (
+        DRAFT_HEAD == "mxfp8"
+        and bool(cost_policy)
+        and mx.default_device() == mx.gpu
+        and _head_ok(model)
+    )
+
+
+def _draft_head(model):
+    """The MXFP8 copy of model.head (weight, scales); built once, normally at load."""
+    cached = model.__dict__.get("_ds41_draft_head")
+    if cached is None or cached.source is not model.head.weight:
+        w, scales = mx.quantize(model.head.weight, group_size=32, bits=8, mode="mxfp8")
+        mx.eval(w, scales)
+        cached = model.__dict__["_ds41_draft_head"] = SimpleNamespace(
+            weight=w, scales=scales, source=model.head.weight
+        )
+    return cached
+
+
+def install_draft_head(model):
+    """og_model.load: quantize the MXFP8 draft head at load, not inside the first draft."""
+    if DRAFT_HEAD != "mxfp8":
+        return None
+    if mx.default_device() != mx.gpu or not _head_ok(model):
+        summary = dict(event="draft_head", mode="bf16", reason="head or device unsupported")
+    else:
+        begin = time.perf_counter()
+        head = _draft_head(model)
+        STATS["draft_head_mxfp8"] = 1
+        summary = dict(
+            event="draft_head",
+            mode="mxfp8",
+            shape=list(model.head.weight.shape),
+            gib=round((head.weight.nbytes + head.scales.nbytes) / 2**30, 3),
+            seconds=round(time.perf_counter() - begin, 3),
+        )
+    print(json.dumps(summary), flush=True)
+    return summary
+
+
+def _mxfp8_logits(model, x):
+    """og_fused._rows (fast_qmv rows kernel) on the MXFP8 head: FP32 logits, M-invariant."""
+    from . import og_fused
+
+    batch, width, dim = x.shape
+    rows = x.reshape(1, batch * width, dim).astype(mx.bfloat16)
+    return og_fused._rows(_draft_head(model), rows).reshape(batch, width, -1).astype(mx.float32)
+
+
+def draft_logits(model, x, cost_policy=False):
+    rows = x.size // x.shape[-1]
+    if x.ndim == 3 and rows <= _MAX_BATCH_ROWS and use_mxfp8(model, cost_policy):
+        _count("mxfp8", rows)
+        return _mxfp8_logits(model, x)
+    _count("bf16", rows)
+    return project_logits(x, model.head)
 
 
 class DSparkAttention(Attention):
@@ -30,8 +136,9 @@ class DSparkAttention(Attention):
         c = self._config
         batch, length, _ = x.shape
         positions = range(cache.offset, cache.offset + length)
+        query, kv_input = self._input_projections(x)
         q = rope(
-            self.wq_b(self.q_norm(self.wq_a(x))).reshape(
+            self.wq_b(self.q_norm(query)).reshape(
                 batch, length, c.n_heads, c.head_dim
             ),
             positions,
@@ -39,7 +146,7 @@ class DSparkAttention(Attention):
             False,
         )
         draft_kv = quantize_activation(
-            rope(self.kv_norm(self.wkv(x)), positions, c, False)
+            rope(self.kv_norm(kv_input), positions, c, False)
         )
         kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
         # V4.1 does not apply V4's per-head query RMS normalization.
@@ -59,9 +166,17 @@ class DSparkAttention(Attention):
         )
         out = rope(out, positions, c, False, inverse=True)
         # 1017 reference DSparkAttention: act_quant(o) before the wo_a einsum.
-        grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
+        grouped = self._output_heads(out).reshape(batch, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
-        return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
+        supported = decode_fusions.grouped_gemv_supported(grouped, weight)
+        if supported and attn_out.supported(self.wo_b, grouped, weight):
+            return self.wo_b.project_quantized(attn_out.grouped_gemv_q(self.wo_a, grouped, weight).flatten(-2))
+        projected = (
+            woa_compact.grouped_gemv(self.wo_a, grouped, weight)
+            if supported
+            else mx.einsum("bsgd,grd->bsgr", grouped, weight)
+        )
+        return self.wo_b(projected.flatten(-2))
 
 
 class MarkovHead(nn.Module):
@@ -73,7 +188,7 @@ class MarkovHead(nn.Module):
     def __call__(self, ids):
         embedding = self.embed(ids)
         return (
-            project_logits(embedding, self.head.weight),
+            project_logits(embedding, self.head),
             embedding,
         )
 
@@ -190,8 +305,12 @@ def forward_spec(model, input_ids, main_hidden, cache, *, temperature=0.0):
     )
 
 
-def proposal_forward(model, input_ids, cache, draft_length=None):
-    """Compute parallel draft logits; the shared loop applies Markov biases."""
+def proposal_forward(model, input_ids, cache, draft_length=None, cost_policy=False):
+    """Compute parallel draft logits; the shared loop applies Markov biases.
+
+    cost_policy: the caller drafts this block on the cost-policy path (hist_offset >= 1024),
+    where DS41_DRAFT_HEAD=mxfp8 may serve the head (draft_logits).
+    """
     c = model._config
     width = max(1, min(draft_length or c.dspark_block_size, c.dspark_block_size))
     input_ids = input_ids.reshape(input_ids.shape[0], -1)[:, -1:]
@@ -208,9 +327,141 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
     )
     h = mx.repeat(model.embed(ids)[..., None, :], c.hc_mult, -2)
     pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
-    for stage, item in zip(model.mtp, cache):
+    for index, (stage, item) in enumerate(zip(model.mtp, cache)):
         h, pre = stage(h, pre, item)
+        if DRAFT_ASYNC and index + 1 < len(model.mtp):
+            # Start the GPU on this stage while Python builds the next one.
+            mx.async_eval(h, pre)
     final = model.mtp[-1]
     h = hc_pre(h, pre)
-    logits = project_logits(final.norm(h), model.head.weight)
+    logits = draft_logits(model, final.norm(h), cost_policy)
     return logits, h
+
+
+# Batched drafting for og_fused pairs: one DSpark decoder pass over several requests' blocks
+# (DS41_OG_DRAFT_BATCH=0 = one pass per request). Every request gets its own pass's bits.
+DRAFT_BATCH = os.environ.get("DS41_OG_DRAFT_BATCH", "1") == "1"
+
+
+def _stages_ok(model):
+    # Historical production's affine vocabulary head excluded og_fused
+    # drafting. Keep that effective policy despite the stable module split.
+    if hasattr(model.head, "bits"):
+        return False
+    from .quantization import QuantizedProjection
+    return all(
+        all(isinstance(p, QuantizedProjection) and p.quantize_input
+            for p in (stage.attn.wq_a, stage.attn.wkv, stage.attn.wq_b, stage.attn.wo_b))
+        and stage.attn.wo_a.weight.dtype == mx.bfloat16
+        for stage in model.mtp)
+
+
+def batch_supported(model, widths):
+    """Several blocks of one width 2..4 (<= 8 rows), the og_fused kernels on (either draft head)."""
+    return (
+        DRAFT_BATCH
+        and len(widths) > 1
+        and len(set(widths)) == 1
+        and 2 <= widths[0]
+        and widths[0] * len(widths) <= _MAX_BATCH_ROWS
+        and mx.default_device() == mx.gpu
+        and _stages_ok(model)
+    )
+
+
+def _attention_batch(attn, x, bounds, caches):
+    """DSparkAttention.__call__ for several requests: projections once, attention per request."""
+    c = attn._config
+    xq = quantize_activation(x)
+    query, kv_input = attn.wq_a.project_quantized(xq), attn.wkv.project_quantized(xq)
+    q_all = attn.wq_b(attn.q_norm(query))
+    heads = []
+    for (b, e), cache in zip(bounds, caches):
+        length = e - b
+        positions = range(cache.offset, cache.offset + length)
+        q = rope(q_all[:, b:e].reshape(1, length, c.n_heads, c.head_dim), positions, c, False)
+        draft_kv = quantize_activation(rope(attn.kv_norm(kv_input[:, b:e]), positions, c, False))
+        kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
+        out = (
+            mx.fast.scaled_dot_product_attention(
+                q.astype(mx.float32).transpose(0, 2, 1, 3),
+                kv[:, None].astype(mx.float32),
+                kv[:, None].astype(mx.float32),
+                scale=c.head_dim**-0.5,
+                sinks=attn.attn_sink.astype(mx.float32),
+            )
+            .transpose(0, 2, 1, 3)
+            .astype(q.dtype)
+        )
+        heads.append(attn._output_heads(rope(out, positions, c, False, inverse=True)))
+    out = mx.concatenate(heads, 1)
+    grouped = out.reshape(1, out.shape[1], c.o_groups, -1)
+    weight = attn.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+    if attn_out.supported(attn.wo_b, grouped, weight, max_rows=_MAX_BATCH_ROWS):
+        return attn.wo_b.project_quantized(attn_out.grouped_gemv_q(attn.wo_a, grouped, weight, compact=False).flatten(-2))
+    projected = decode_fusions.grouped_gemv(grouped, weight)
+    return attn.wo_b(projected.flatten(-2))
+
+
+def _stage_batch(stage, hs, pres, bounds, caches):
+    """DSparkBlock.__call__ per request, with attention projections and the MoE shared (mHC stays per request)."""
+    c = stage._config
+    mixes = [hc_mixes(h, stage.hc_attn_fn, stage.hc_attn_scale, stage.hc_attn_base, c) for h in hs]
+    x = mx.concatenate([stage.attn_norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], 1)
+    a = _attention_batch(stage.attn, x, bounds, caches)
+    hs = [hc_post(a[:, b:e], h, ao, ac) for (b, e), h, (_, ao, ac) in zip(bounds, hs, mixes)]
+    ffn = [hc_mixes(h, stage.hc_ffn_fn, stage.hc_ffn_scale, stage.hc_ffn_base, c) for h in hs]
+    x = mx.concatenate([stage.ffn_norm(hc_pre(h, ap)) for h, (ap, _, _) in zip(hs, mixes)], 1)
+    f = stage.ffn(x, None)
+    hs = [hc_post(f[:, b:e], h, fo, fc) for (b, e), h, (_, fo, fc) in zip(bounds, hs, ffn)]
+    return hs, [fp for fp, _, _ in ffn]
+
+
+def proposal_forward_batch(model, anchors, caches, width, cost_policy=None):
+    """proposal_forward for several requests of one width; returns each request's draft logits.
+
+    cost_policy: per request, as proposal_forward's (see batch_logits).
+    """
+    cost_policy = [False] * len(anchors) if cost_policy is None else list(cost_policy)
+    if len(cost_policy) != len(anchors):
+        raise ValueError("cost_policy needs one entry per request")
+    c = model._config
+    hs, pres, bounds = [], [], []
+    for k, anchor in enumerate(anchors):
+        ids = mx.concatenate(
+            [
+                anchor.reshape(1, -1)[:, -1:],
+                mx.full((1, width - 1), c.dspark_noise_token_id, dtype=anchor.dtype),
+            ],
+            axis=1,
+        )
+        h = mx.repeat(model.embed(ids)[..., None, :], c.hc_mult, -2)
+        hs.append(h)
+        pres.append(mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]))
+        bounds.append((k * width, (k + 1) * width))
+    for index, (stage, *items) in enumerate(zip(model.mtp, *caches)):
+        hs, pres = _stage_batch(stage, hs, pres, bounds, items)
+        if DRAFT_ASYNC and index + 1 < len(model.mtp):
+            mx.async_eval(hs, pres)
+    final = model.mtp[-1]
+    return batch_logits(model, [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], width, cost_policy)
+
+
+def batch_logits(model, xs, width, cost_policy):
+    """proposal_forward_batch's head: each request's (1, width, dim) normed rows -> its draft logits.
+
+    The MXFP8 and BF16 heads each run once over their requests' rows (request order kept);
+    both head kernels are M-invariant, so every request gets draft_logits' bits.
+    """
+    quantized = [use_mxfp8(model, policy) for policy in cost_policy]
+    out = [None] * len(xs)
+    for mxfp8 in (False, True):
+        group = [k for k, q in enumerate(quantized) if q == mxfp8]
+        if not group:
+            continue
+        x = mx.concatenate([xs[k] for k in group], 1)
+        _count("mxfp8" if mxfp8 else "bf16", x.shape[1])
+        logits = _mxfp8_logits(model, x) if mxfp8 else project_logits(x, model.head)
+        for j, k in enumerate(group):
+            out[k] = logits[:, j * width:(j + 1) * width]
+    return out

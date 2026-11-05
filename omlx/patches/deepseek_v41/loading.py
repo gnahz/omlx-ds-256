@@ -22,8 +22,9 @@ from .convert import iter_source_weights, source_engram_tables
 from .dspark import make_stages
 from .model import Model
 from .processing import Processor
-from .quantization import QuantizedProjection
+from .quantization import QuantizedEmbedding, QuantizedProjection
 from .storage import DiskEngramEmbedding, EngramPrefetch, TensorFile, decode_array
+from .native_metadata import NativeMetadataPlan, enabled_proof
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,9 @@ def load(
     if ced_prefill:
         if config.ced_layout_supported():
             config.ced_prefill = True
-            logger.info("DeepSeek V4.1 CED prefill enabled: decoder tail %d", config.window_size)
+            logger.info(
+                "DeepSeek V4.1 CED prefill enabled: decoder tail %d", config.window_size
+            )
         else:
             config.ced_prefill = False
             logger.warning(
@@ -169,6 +172,13 @@ def load(
                 "DeepSeek V4.1 A8 prefill requested but this GPU has no INT8 "
                 "tensor kernels; keeping the A16 path"
             )
+    native_plan = None
+    proof_path = enabled_proof()
+    if proof_path is not None:
+        if source_checkpoint or not config.preserve_mtp or moe_expert_offload_resident_fraction is not None:
+            raise ValueError("Native G128 metadata requires the converted full-resident checkpoint with complete MTP")
+        native_plan = NativeMetadataPlan(path, proof_path)
+        logger.info("Native G128 metadata: %s", native_plan.summary())
     model = Model(config)
     if whole_config is not None:
         # Draft stages built from the unsharded shapes; Block._tensor_group
@@ -194,6 +204,8 @@ def load(
             or (name in ("scales", "biases") and f"{module}.weight" in held)
         )
 
+    if native_plan is not None:
+        model._native_metadata_plan = native_plan
     if config.engram_layer_ids:
         logger.info(
             "DeepSeek V4.1 Engram mode: %s",
@@ -273,6 +285,7 @@ def load(
                 ", DSpark draft head resident" if config.preserve_mtp else "",
             )
         offload_keys = set(offload.excluded_keys) if offload is not None else set()
+        native_keys = native_plan.keys if native_plan is not None else set()
         if offload is not None and not source_checkpoint and not config.preserve_mtp:
             offload_keys.update(
                 k for k in mapping if k.startswith("language_model.mtp.")
@@ -291,19 +304,21 @@ def load(
                     keys = {key for key, file in mapping.items() if file == filename}
                     normal_keys = {
                         key
-                        for key in keys - engram_keys - offload_keys
+                        for key in keys - engram_keys - offload_keys - native_keys
                         if in_scope(key)
                     }
                     if not normal_keys:
                         continue
-                    if keys - normal_keys:
+                    if native_plan is not None or keys - normal_keys:
                         # Shared shards must not pull SSD-offloaded tables onto
                         # the GPU when loading their ordinary projections, nor
                         # another stage's layers onto this rank.
-                        reader = TensorFile(path / filename)
+                        reader = TensorFile(path / filename, map_file=native_plan is None)
                         try:
                             values = {
-                                key: decode_array(*reader.read(key))
+                                key: (native_plan.read_original(reader, key)
+                                      if native_plan is not None
+                                      else decode_array(*reader.read(key)))
                                 for key in normal_keys
                             }
                         finally:
@@ -341,6 +356,16 @@ def load(
                 all_quantized.update(quantized)
                 for name, spec in quantized.items():
                     if name + ".weight" in values:
+                        if native_plan is not None and native_plan.contains(name):
+                            projection = native_plan.projection(
+                                name, values[name + ".weight"], spec,
+                                expected_shapes[name + ".weight"],
+                            )
+                            set_module(model, name, projection)
+                            loaded_bytes += (projection.joint_words.nbytes
+                                             + projection.joint_dictionary.nbytes)
+                            replaced.add(name)
+                            continue
                         if name + ".scales" not in values:
                             raise ValueError(
                                 f"Quantized projection must be stored in one shard: {name}"
@@ -368,7 +393,11 @@ def load(
                         set_module(
                             model,
                             name,
-                            QuantizedProjection(
+                            (
+                                QuantizedEmbedding
+                                if name == "language_model.embed"
+                                else QuantizedProjection
+                            )(
                                 values[name + ".weight"],
                                 values[name + ".scales"],
                                 biases=biases,
@@ -400,6 +429,17 @@ def load(
                     )
         expected = {name for name, _ in tree_flatten(model.parameters())}
         scope_keys = {key for key in mapping if in_scope(key)}
+        if native_plan is not None:
+            native_plan.validate_complete()
+            # Runtime-only: charge a single temporary dense metadata bank in
+            # both prefill admission and adaptive chunk estimates.
+            model.config._native_metadata_prefill_transient_bytes = (
+                native_plan.prefill_transient_bytes
+            )
+            expected = native_plan.original_parameter_keys(expected)
+            seen.update(native_plan.keys)
+            for layer in model.language_model.layers:
+                layer.ffn.experts._native_metadata = True
         if (
             seen != expected
             or replaced != set(all_quantized)
@@ -428,6 +468,7 @@ def load(
         tokenizer.tool_call_end = tool_call_end
         tokenizer.tool_parser = parse_tool_call
         processor = Processor(tokenizer, model.config)
+        model.language_model._ds41_draft_tokenizer = tokenizer
         if model.config.engram_layer_ids:
             model.language_model.set_tokenizer(tokenizer)
         # Load the backbone before reserving RAM for large Engram tables.
@@ -444,7 +485,10 @@ def load(
         model.eval()
         return model, processor
     except BaseException:
-        model.close()
+        try:
+            model.close()
+        except BaseException:
+            logger.exception("DeepSeek V4.1 cleanup failed after load failure")
         raise
     finally:
         memory_scope.close()

@@ -54,6 +54,106 @@ def _independent_verify(model):
     return False
 
 
+def _advance_dspark(batch, batch_state, host):
+    """One ragged target call, followed by each UID's existing acceptance loop."""
+    import os
+
+    pending = [
+        (index, batch_state.states[uid])
+        for index, uid in enumerate(batch.uids)
+        if not batch_state.states[uid].queue
+    ]
+    if len(pending) < 2 or os.environ.get("DS41_BATCH_VERIFY", "1") == "0":
+        return False
+    if any(bg._box_pending(state) for _, state in pending):
+        return False  # remotely drafted blocks resolve in the per-request cycle
+    # Bounded workspace; longer drafts (context-copy) and larger batches
+    # retain the exact independent path. Checked before any cache extraction.
+    lengths = [1 + int(state.drafts.shape[0]) for _, state in pending]
+    if any(length > 8 for length in lengths):
+        return False
+    row_caches = host.mtp_extract_request_caches(batch.prompt_cache)
+    rows = [
+        (
+            index,
+            bg._make_row_batch(
+                batch, index, prompt_cache=row_caches[index], state=state
+            ),
+            state,
+        )
+        for index, state in pending
+    ]
+    inputs = [
+        mx.concatenate([state.next_main, state.drafts])[None, :] for _, _, state in rows
+    ]
+    started = time.perf_counter()
+    results = host.mtp_verify_requests(inputs, [row.prompt_cache for _, row, _ in rows])
+    mx.eval([result[:2] for result in results])
+    elapsed = (time.perf_counter() - started) * 1000 / len(rows)
+    replacements = {}
+    for (index, row, state), result in zip(rows, results):
+        bg._run_verify_cycle_chain(row, state, verify_result=result, verify_ms=elapsed)
+        replacements[index] = row.prompt_cache
+        batch._token_context[index] = row._token_context[0]
+    bg._replace_cache_rows(batch, replacements)
+    return True
+
+
+def _advance_groups(batch, batch_state, host):
+    """Host-chosen verify groups (ds41-og), run one after another.
+
+    A group of one takes the ordinary per-request cycle. A larger group verifies
+    in one host.mtp_verify_requests call, then each UID runs its own acceptance,
+    draft and commit on its rows of the result, as _advance_dspark does.
+    """
+    pending = []
+    for index, uid in enumerate(batch.uids):
+        state = batch_state.states[uid]
+        if state.queue:
+            continue
+        if not state.chain or state.next_main is None or (state.drafts is None and not bg._box_pending(state)):
+            return False
+        pending.append((index, state))
+    groups = host.mtp_verify_groups([bg._verify_rows(state) for _, state in pending])
+    if not groups:
+        return False
+    batched_head.flush(batch_state)
+    replacements = {}
+    for group in groups:
+        rows = []
+        for index, state in (pending[g] for g in group):
+            row = bg._make_row_batch(batch, index, state=state)
+            bg._set_singleton_mrope_delta(row)
+            rows.append((index, row, state))
+        if len(rows) == 1:
+            bg._run_verify_cycle(rows[0][1], rows[0][2])
+        else:
+            for _, row, state in rows:
+                bg._resolve_box_drafts(row, state)
+            inputs = [
+                mx.concatenate([state.next_main, state.drafts])[None, :] for _, _, state in rows
+            ]
+            started = time.perf_counter()
+            results = host.mtp_verify_requests(inputs, [row.prompt_cache for _, row, _ in rows])
+            mx.eval([result[:2] for result in results])
+            elapsed = (time.perf_counter() - started) * 1000 / len(rows)
+            # The host may draft the group's next blocks together (its chains queue the drafts).
+            jobs = [] if getattr(host, "mtp_draft_jobs_enabled", False) else None
+            depths = []
+            for (_, row, state), result in zip(rows, results):
+                depths.append(state.controller.cur if state.controller is not None else None)
+                bg._run_verify_cycle_chain(
+                    row, state, verify_result=result, verify_ms=elapsed, draft_jobs=jobs
+                )
+            if jobs is not None:
+                host.mtp_draft_jobs(jobs, depths)
+        for index, row, _ in rows:
+            replacements[index] = row.prompt_cache
+            batch._token_context[index] = row._token_context[0]
+    bg._replace_cache_rows(batch, replacements)
+    return True
+
+
 def advance(batch, batch_state):
     """Advance empty row queues, sharing equal-depth target verification.
 
@@ -62,6 +162,13 @@ def advance(batch, batch_state):
     existing scalar rollback contract, including QSA caches.
     Sampling, processors and head caches always belong to an individual UID.
     """
+    host = bg._dspark_host(batch.model)
+    if host is not None and callable(getattr(host, "mtp_verify_groups", None)):
+        if _advance_groups(batch, batch_state, host):
+            return
+    if host is not None and callable(getattr(host, "mtp_verify_requests", None)):
+        if _advance_dspark(batch, batch_state, host):
+            return
     states = [batch_state.states[uid] for uid in batch.uids]
     if (
         len(states) > 1

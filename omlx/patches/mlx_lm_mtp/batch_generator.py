@@ -30,9 +30,47 @@ from omlx.prefill_progress import get_prefill_tracker
 
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
+from . import copy_draft as _copy_draft
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
+
+
+def _preserves_mtp_requests(model):
+    return any(
+        getattr(host, "_omlx_mtp_preserve_requests", False)
+        and getattr(host, "_omlx_mtp_decode_enabled", False)
+        for host in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "_language_model", None),
+        )
+        if host is not None
+    )
+
+
+def _extend_preserving_mtp(original_extend, batch, donor, *args, **kwargs):
+    """Cache rows and speculative queues move together; never replay a UID."""
+    states = {}
+    for source in (batch, donor):
+        group = getattr(source, "_omlx_mtp_batch_state", None)
+        if group is not None:
+            states.update(group.states)
+        single = getattr(source, "_omlx_mtp_state", None)
+        if single is not None:
+            states[single.uid] = single
+    early = dict(getattr(batch, "_omlx_mtp_early", None) or {})
+    early.update(getattr(donor, "_omlx_mtp_early", None) or {})
+    result = original_extend(batch, donor, *args, **kwargs)
+    if early:
+        batch._omlx_mtp_early = early
+    for source in (batch, donor):
+        for attr in ("_omlx_mtp_state", "_omlx_mtp_batch_state"):
+            if hasattr(source, attr):
+                delattr(source, attr)
+    if states:
+        batch._omlx_mtp_batch_state = _MtpBatchState(states=states)
+    return result
 
 
 def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
@@ -203,6 +241,9 @@ def apply() -> bool:
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
                 if not handed_off:
+                    early = _early_first_emit(self)
+                    if early is not None:
+                        return early
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
@@ -224,6 +265,7 @@ def apply() -> bool:
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            _refuse_standard_after_early(self)
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
@@ -241,6 +283,10 @@ def apply() -> bool:
             return original_next(self, *args, **kwargs)
 
         def patched_extend(self, batch, *args, **kwargs):
+            if _preserves_mtp_requests(self.model):
+                return _extend_preserving_mtp(
+                    original_extend, self, batch, *args, **kwargs
+                )
             # Reconcile before adding rows without MTP state so the drained
             # batch can feed its last tokens without replaying its history.
             if not _reconcile_mtp_batch_to_standard(self):
@@ -279,7 +325,20 @@ def apply() -> bool:
 
         def patched_filter(self, keep, *args, **kwargs):
             old_uids = list(getattr(self, "uids", []) or [])
+            group = getattr(self, "_omlx_mtp_batch_state", None)
+            states = dict(group.states) if group is not None else {}
+            single = getattr(self, "_omlx_mtp_state", None)
+            if single is not None:
+                states[single.uid] = single
+            for index, uid in enumerate(old_uids):
+                tracker = getattr(states.get(uid), "extra_source_tracker", None)
+                if index not in keep and tracker is not None:
+                    tracker.finish(self._num_tokens[index], tool_filter=True)
             result = original_filter(self, keep, *args, **kwargs)
+            early = getattr(self, "_omlx_mtp_early", None)
+            if early:
+                for uid in set(early) - set(self.uids):
+                    del early[uid]
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
             _release_drafter_uids(self.model, set(old_uids) - set(self.uids))
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
@@ -342,6 +401,7 @@ def apply() -> bool:
                 )
             if (
                 _generation_batch_has_active_mtp(gen_batch)
+                and not _preserves_mtp_requests(getattr(gen_batch, "model", None))
                 and not _singleton_mtp_handoff_ready(gen_batch)
                 and getattr(gen_batch, "_omlx_mtp_batch_state", None) is None
             ):
@@ -602,6 +662,8 @@ def _singleton_mtp_handoff_ready(gen_batch: Any) -> bool:
     """Allow a singleton handoff once at most one committed token is unstreamed."""
     if gen_batch is None:
         return False
+    if _preserves_mtp_requests(getattr(gen_batch, "model", None)):
+        return False
     if getattr(gen_batch, "_omlx_mtp_activation_safe", True):
         return False
     if getattr(gen_batch, "_omlx_mtp_batch_state", None) is not None:
@@ -645,6 +707,8 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 
 
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
+    if _preserves_mtp_requests(getattr(gen_batch, "model", None)):
+        return True
     if getattr(gen_batch, state_attr, None) is not None:
         return True
     # The multirow-decode marker guards the singleton-init invariant only
@@ -872,6 +936,10 @@ class _MtpStats:
     mtp_head_ms: float = 0.0  # cumulative time inside MTP-head forwards
     sample_ms: float = 0.0  # cumulative time in sampling + acceptance check
     cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
+    # Cycles whose draft came from the context-copy index (DeepSeek DSpark).
+    copy_cycles: int = 0
+    copy_drafted: int = 0
+    copy_accepted: int = 0
 
 
 @dataclass
@@ -942,6 +1010,9 @@ class _MtpState:
     # Adaptive depth controller (None = fixed depth). Chooses how many
     # drafts the next chain builds from rolling accept/latency estimates.
     controller: Optional[Any] = None
+    # Context-copy drafter (greedy DSpark requests without processors).
+    copy_index: Optional[Any] = None
+    draft_source: str = "head"
 
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
@@ -1401,8 +1472,10 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
             prompt_cache=gen_batch.prompt_cache if shared is not None else None,
         )
         _set_singleton_mrope_delta(row)
+        emitted = _early_emitted(gen_batch, uid)
+        extra = {"main_emitted": True} if emitted else {}
         if shared is None:
-            _post_init_mtp(row)
+            _post_init_mtp(row, **extra)
         else:
             logits, hidden, offsets, captured = shared
             _post_init_mtp(
@@ -1414,11 +1487,14 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
                     _slice_captured(captured, idx),
                 ),
                 priming_offset=offsets[idx],
+                **extra,
             )
         state = getattr(row, "_omlx_mtp_state", None)
         if not _mtp_state_valid_for_batch(row, state):
             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
             return None
+        if emitted:
+            gen_batch._omlx_mtp_early.pop(uid, None)
         states[uid] = state
         if shared is None:
             replacements[idx] = row.prompt_cache
@@ -1455,6 +1531,8 @@ def _batch_park_memory(model: Any):
 
 
 def _batch_policy_for_next(gen_batch: Any):
+    if _preserves_mtp_requests(getattr(gen_batch, "model", None)):
+        return None
     from .batch_policy import BatchPolicy
 
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
@@ -1534,11 +1612,15 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
 
     park_state = _mtp_park_state_for_batch(gen_batch)
     _set_singleton_mrope_delta(gen_batch)
-    _post_init_mtp(gen_batch)
+    uid = gen_batch.uids[0]
+    emitted = _early_emitted(gen_batch, uid)
+    _post_init_mtp(gen_batch, **({"main_emitted": True} if emitted else {}))
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
         _drop_mtp_state(gen_batch, "post-init-invalid")
         return None
+    if emitted:
+        gen_batch._omlx_mtp_early.pop(uid, None)
 
     # Eligibility already admitted this parked singleton. Mark the fresh
     # state unconditionally so a prefill arriving between the two checks
@@ -3088,47 +3170,123 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
-def _dspark_next_drafts(
+def _dspark_prepare(
     gen_batch: Any,
     state: _MtpState,
     hidden_rows: Any,
     committed: Any,
-    prev_buf: Optional[Any],
+    prev_buf: Optional[Any] = None,
     depth: Optional[int] = None,
-) -> None:
-    """Append committed target taps and sample one DSpark block.
+) -> Optional[tuple]:
+    """Prepare one request for a shared DSpark decoder forward.
 
-    The expensive three-stage decoder runs once over anchor+noise positions.
-    A rank-R Markov head then samples left-to-right, preserving DSpark's
-    intra-block dependency without another decoder pass.
+    Returns None when this cycle's block is already set (a copy/extra-source
+    proposal, or depth 0), else ``(host, width, anchor, cost_policy)``.
     """
     import mlx.core as mx
 
     host = _dspark_host(gen_batch.model)
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
+    box = getattr(host, "mtp_box_prepare", None)
+    if box is not None and box(gen_batch, state, hidden_rows, committed):
+        # ds41-og box drafting: the host sent this block's STEPD (drafts arrive via _resolve_box_drafts).
+        return None
 
     if depth is None:
         depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
+    copy = state.copy_index
+    tracker = None
+    if copy is not None and state.hist_offset >= 1024:
+        from omlx.patches.deepseek_v41 import draft_sources
+
+        if not hasattr(state, "extra_source_tracker"):
+            state.extra_source_tracker = draft_sources.create(host, copy)
+        tracker = state.extra_source_tracker
+        if tracker is not None:
+            tracker.append(committed.tolist(), hidden_rows)
+    if copy is not None:
+        copy.append(committed.tolist())
+        budget = (
+            int(gen_batch.max_tokens[0])
+            - int(gen_batch._num_tokens[0])
+            - len(state.queue)
+            - 1
+        )
+        draft, source = (
+            tracker.propose(
+                copy._buf[max(0, copy.n - 64) : copy.n].tolist(), budget
+            )
+            if tracker is not None
+            else (None, None)
+        )
+        if not draft:
+            draft, source = copy.propose(budget), "copy"
+        if draft:
+            # Keep the committed target taps; this proposal avoids a drafter
+            # forward and every proposed token is still verified by the target.
+            host.dspark_append_context(hidden_rows, state.mtp_cache)
+            state.hist_offset += n
+            state.drafts = mx.array(draft, dtype=mx.uint32)
+            state.draft_lps = [None] * len(draft)
+            state.draft_accept_lps = [None] * len(draft)
+            state.draft_source = source
+            return None
+    state.draft_source = "dspark"
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
         state.hist_offset += n
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = []
-        return
+        return None
 
-    anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=depth,
+    cost_policy = (
+        bool(getattr(state.controller, "cost_policy", False))
+        and state.hist_offset >= 1024
     )
-    state.hist_offset += n
+    width = state.controller.max_depth if cost_policy else depth
+    return host, width, committed[-1:].reshape(1, 1), cost_policy
 
+
+def _box_pending(state: Any) -> bool:
+    """A block the host is drafting remotely (ds41-og box drafting): its drafts arrive before its verify."""
+    return getattr(state, "box_pending", None) is not None
+
+
+def _verify_rows(state: Any) -> int:
+    """Rows of a state's next verify; a remotely drafted block counts as the widest (1 + dspark block width 4)."""
+    if state.drafts is None and _box_pending(state):
+        return 5
+    return 1 + int(state.drafts.shape[0])
+
+
+def _resolve_box_drafts(gen_batch: Any, state: Any) -> None:
+    """Fetch a remotely drafted block (or let the host draft it locally) before anything reads state.drafts."""
+    if _box_pending(state):
+        _dspark_host(gen_batch.model).mtp_box_resolve(gen_batch, state)
+
+
+def _dspark_head_kwargs(host: Any, cost_policy: Any) -> dict:
+    """``cost_policy`` for hosts whose draft head depends on it (V4.1 DS41_DRAFT_HEAD); others keep their signature."""
+    if getattr(host, "_omlx_dspark_cost_head", False):
+        return {"cost_policy": cost_policy}
+    return {}
+
+
+def _dspark_finish(
+    gen_batch: Any,
+    state: _MtpState,
+    plan: tuple,
+    logits: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Everything of _dspark_next_drafts after the DSpark decoder forward (Markov sampling)."""
+    import mlx.core as mx
+
+    host, width, anchor, cost_policy = plan
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     draft_toks: List[Any] = []
@@ -3142,7 +3300,7 @@ def _dspark_next_drafts(
     # before the loop and rewind after.
     snap = _snap_snapshotable(procs)
 
-    for idx in range(depth):
+    for idx in range(width):
         bias, _ = host.dspark_markov(previous)
         logits_2d = logits[:, idx, :] + bias
         if procs is not None and prev_buf is not None:
@@ -3160,10 +3318,115 @@ def _dspark_next_drafts(
 
     _restore_snapshotable(procs, snap)
 
-    state.drafts = mx.concatenate(draft_toks)
+    if cost_policy:
+        # One host sync resolves the probabilities and every draft id; the
+        # chosen prefix is host-built, so sending it (og presend) costs no
+        # second GPU round trip for a tiny concatenate (~0.25 ms).
+        probabilities = mx.exp(mx.stack([mx.max(lp) for lp in draft_lps]))
+        drafted = mx.concatenate(draft_toks)
+        mx.eval(probabilities, drafted)
+        depth = state.controller.choose_cost_depth(
+            probabilities.tolist(), state.hist_offset
+        )
+        state.drafts = mx.array(drafted.tolist()[:depth], dtype=drafted.dtype)
+        draft_lps = draft_lps[:depth]
+        draft_accept_lps = draft_accept_lps[:depth]
+    else:
+        state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
     mx.async_eval(state.drafts)
+
+
+
+
+def _dspark_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+    depth: Optional[int] = None,
+) -> None:
+    """Append committed target taps and sample one DSpark block.
+
+    The expensive three-stage decoder runs once over anchor+noise positions.
+    A rank-R Markov head then samples left-to-right, preserving DSpark's
+    intra-block dependency without another decoder pass.
+    """
+    plan = _dspark_prepare(gen_batch, state, hidden_rows, committed, prev_buf, depth)
+    if plan is None:
+        return
+    host, width, anchor, cost_policy = plan
+    logits, _ = host.dspark_forward(
+        hidden_rows,
+        anchor,
+        state.mtp_cache,
+        draft_length=width,
+        **_dspark_head_kwargs(host, bool(cost_policy)),
+    )
+    state.hist_offset += int(committed.shape[0])
+    _dspark_finish(gen_batch, state, plan, logits, prev_buf)
+
+
+def dspark_draft_jobs(jobs: List[tuple], depths: List[Optional[int]]) -> bool:
+    """Draft several requests' next blocks, sharing one DSpark decoder pass when possible.
+
+    ``jobs`` are _run_verify_cycle_chain draft_jobs entries (gen_batch, state,
+    hidden_rows, committed, prev_buf); ``depths`` the controller depth each
+    request had when its chain queued the job (the chain's controller.observe
+    runs before a queued draft). Every request gets exactly the block its own
+    _dspark_next_drafts would produce: the same per-request steps, with the
+    decoder forward of the requests that need one run by
+    host.dspark_forward_batch when it accepts them (else one by one).
+    Returns whether one shared pass was used.
+    """
+    plans = []
+    for (gen_batch, state, hidden_rows, committed, _), depth in zip(jobs, depths):
+        t0 = time.perf_counter()
+        if not state.head_clone:
+            _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+        controller = state.controller
+        if controller is not None and depth is not None:
+            observed, controller.cur = controller.cur, depth
+        try:
+            plans.append(_dspark_prepare(gen_batch, state, hidden_rows, committed))
+        finally:
+            if controller is not None and depth is not None:
+                controller.cur = observed
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+    forward = [i for i, plan in enumerate(plans) if plan is not None]
+    host = plans[forward[0]][0] if forward else None
+    batch = getattr(host, "dspark_forward_batch", None)
+    logits = (
+        batch(
+            [jobs[i][2] for i in forward],
+            [plans[i][2] for i in forward],
+            [jobs[i][1].mtp_cache for i in forward],
+            [plans[i][1] for i in forward],
+            **_dspark_head_kwargs(host, [bool(plans[i][3]) for i in forward]),
+        )
+        if len(forward) > 1 and batch is not None
+        else None
+    )
+    batched = logits is not None
+    if logits is None:
+        logits = [
+            host.dspark_forward(
+                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1],
+                **_dspark_head_kwargs(host, bool(plans[i][3])),
+            )[0]
+            for i in forward
+        ]
+    share = (time.perf_counter() - t0) * 1000 / max(1, len(forward))
+    for i, block in zip(forward, logits):
+        gen_batch, state, _, committed, prev_buf = jobs[i]
+        t0 = time.perf_counter()
+        state.hist_offset += int(committed.shape[0])
+        _dspark_finish(gen_batch, state, plans[i], block, prev_buf)
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000 + share
+    return batched
 
 
 def _chain_next_drafts(
@@ -3340,7 +3603,67 @@ def _chain_next_drafts(
 # ---------------------------------------------------------------------------
 
 
-def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -> None:
+def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
+    """Emit a fresh singleton's first token (main_tok) before its post-init.
+
+    Only for hosts that opt in (``_omlx_mtp_early_first``, ds41-og): the
+    post-init's second forward and first draft then run on the next call,
+    exactly as they would have, and the queue no longer carries main_tok
+    (``main_emitted``). The emitted token, its logprobs, the stop/length
+    checks and every later token are unchanged; the host may pre-send the
+    post-init forward (``mtp_first_presend``) so it overlaps the emission.
+    """
+    model = getattr(gen_batch, "model", None)
+    host = next(
+        (
+            h
+            for h in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None))
+            if h is not None and getattr(h, "_omlx_mtp_early_first", False)
+        ),
+        None,
+    )
+    # Request-preserving hosts only: their joins keep each uid's MTP state (and this marker),
+    # so no standard step can replay main_tok.
+    if host is None or not _preserves_mtp_requests(model):
+        return None
+    if getattr(gen_batch, "_omlx_mtp_state", None) is not None:
+        return None
+    if gen_batch._next_tokens is None or len(gen_batch.uids) != 1:
+        return None
+    uid = gen_batch.uids[0]
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    if early is None:
+        early = gen_batch._omlx_mtp_early = {}
+    if uid in early:
+        return None
+    main_id = int(_ensure_uint32(gen_batch._next_tokens).tolist()[0])
+    early[uid] = main_id
+    result = _emit_response(gen_batch, main_id, gen_batch._next_logprobs[0])
+    if result[0].finish_reason is None:
+        presend = getattr(host, "mtp_first_presend", None)
+        if presend is not None:
+            presend(gen_batch, main_id)
+    return result
+
+
+def _early_emitted(gen_batch: Any, uid: Any) -> bool:
+    """True while this uid's main_tok is emitted but its post-init has not run yet."""
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    return bool(early) and uid in early
+
+
+def _refuse_standard_after_early(gen_batch: Any) -> None:
+    """The standard step would emit main_tok a second time: fail the step instead."""
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    if early and any(uid in early for uid in getattr(gen_batch, "uids", ()) or ()):
+        raise RuntimeError(
+            "Lightning MTP post-init failed after the first token was emitted"
+        )
+
+
+def _post_init_mtp(
+    gen_batch: Any, *, verify_result=None, priming_offset=None, main_emitted=False
+) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
 
     State on entry (after standard ``__init__``):
@@ -3472,10 +3795,27 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         else:
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
-        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+        main_id = int(main_tok.tolist()[0])
+        if main_emitted:
+            # _early_first_emit already sent main_tok (and appended it to tokens[0]).
+            _bump_emit_stat(state, "init")
+        else:
+            state.queue.append((main_id, main_lp, "init"))
         state.queue.append(
             (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
         )
+        if (
+            _copy_draft.ENABLED
+            and _dspark_host(gen_batch.model) is not None
+            and _is_greedy(gen_batch)
+            and procs is None
+        ):
+            # tokens[0] holds every prompt token in the cache; main_tok was
+            # forwarded above and is emitted from the queue (or already was).
+            tokens = gen_batch.tokens[0]
+            state.copy_index = _copy_index(
+                gen_batch, tokens, len(tokens) - bool(main_emitted), main_id
+            )
         _chain_next_drafts(
             gen_batch,
             state,
@@ -3525,12 +3865,26 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     state.draft_lp = draft_lp_2d.squeeze(0)
     state.draft_accept_lp = draft_accept_lp_2d.squeeze(0)
     state.draft_id = int(draft_tok.tolist()[0])
-    state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+    if main_emitted:
+        _bump_emit_stat(state, "init")
+    else:
+        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
     state.queue.append(
         (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
     )
 
     gen_batch._omlx_mtp_state = state
+
+
+def _copy_index(gen_batch: Any, tokens: List[int], n: int, main_id: int) -> Any:
+    """CopyIndex(tokens[:n] + [main_id]), from the host's prebuilt prompt index when it has one."""
+    hook = getattr(_dspark_host(gen_batch.model), "mtp_copy_prompt_index", None)
+    pre = hook(gen_batch.prompt_cache) if hook is not None else None
+    if pre is not None and pre.matches(tokens, n):
+        index = _copy_draft.CopyIndex.from_prompt(pre, [main_id])
+        if index is not None:
+            return index
+    return _copy_draft.CopyIndex(list(tokens[:n]) + [main_id])
 
 
 # ---------------------------------------------------------------------------
@@ -3695,6 +4049,9 @@ def _emit_ragged_responses(
                     )
                 )
                 if state is not None:
+                    tracker = getattr(state, "extra_source_tracker", None)
+                    if tracker is not None:
+                        tracker.finish(gen_batch._num_tokens[idx])
                     _log_mtp_stats(uid, state.stats, finish_reason)
                 finished_uids.append(uid)
                 row_finished = True
@@ -4264,6 +4621,7 @@ def _max_verify_rows(model: Any) -> Optional[int]:
         if rows is not None:
             return int(rows)
     return None
+DSPARK_GENERIC_CONTEXT_COPY = False
 
 
 def _context_copy_drafts(
@@ -4282,6 +4640,10 @@ def _context_copy_drafts(
     ``[]`` when the MTP head should draft instead. With ``block``, only a copy
     of exactly that many tokens replaces the drafter's block.
     """
+    if not DSPARK_GENERIC_CONTEXT_COPY and _dspark_host(gen_batch.model) is not None:
+        # DSpark retains its qualified CopyIndex proposer and acceptance-only
+        # policy. Do not stack the new generic upstream copier on top of it.
+        return []
     if state.context_copy is None:
         # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
         # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
@@ -4339,6 +4701,8 @@ def _run_verify_cycle_chain(
 
     import mlx.core as mx
 
+    if verify_result is None:
+        _resolve_box_drafts(gen_batch, state)
     missing = "chain cycle entered without next_main / drafts"
     sync = _cluster_mtp(gen_batch.model)
     follower = sync is not None and not sync.is_leader
@@ -4381,6 +4745,7 @@ def _run_verify_cycle_chain(
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
     prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    verify_targets = None  # greedy argmax of every verified row (ds41-og box drafting sends them with the accept)
     if procs is not None:
         buf = gen_batch._token_context[0]
         prev_rows[0] = buf.update_and_fetch(state.next_main)
@@ -4465,6 +4830,7 @@ def _run_verify_cycle_chain(
         m = int(host[0])
         target_ids = host[1 : k + 2]
         draft_ids = host[k + 2 :]
+        verify_targets = target_ids
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         emit_last_id = target_ids[m] if m < k else target_ids[k]
@@ -4592,6 +4958,12 @@ def _run_verify_cycle_chain(
         state.stats.accepts += m
     if m < k:
         state.stats.rejects += 1
+    if state.draft_source == "copy":
+        state.stats.copy_cycles += 1
+        state.stats.copy_drafted += k
+        state.stats.copy_accepted += m
+        if state.copy_index is not None:
+            state.copy_index.observe(m)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     accept_ms = (time.perf_counter() - cycle_t0) * 1000
@@ -4659,6 +5031,9 @@ def _run_verify_cycle_chain(
                 [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
             )
             state.copy_drafts = True
+        state.last_verify = (
+            (m, verify_targets, draft_ids, state.next_main) if verify_targets is not None else None
+        )
         state.next_main = next_main
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
 
@@ -5126,6 +5501,10 @@ def _emit_response(
         finish_reason = "stop"
 
     if finish_reason is not None:
+        mtp_state = getattr(gen_batch, "_omlx_mtp_state", None)
+        tracker = getattr(mtp_state, "extra_source_tracker", None)
+        if tracker is not None:
+            tracker.finish(gen_batch._num_tokens[0])
         prompt_cache = gen_batch.extract_cache(0)
         all_tokens = gen_batch.tokens[0]
         response = Response(

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
 from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v41.workspace import packed_index_workspace_bytes as _v41_index_workspace_bytes
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -577,7 +578,11 @@ class MemoryMonitor:
 
         # Log estimated memory per block
         if num_layers and num_kv_heads and head_dim:
-            sample_block_mem = self.estimate_block_memory(64)  # 64 tokens
+            sample_block_mem = (
+                self._prefill_memory_profile.estimate_resident_kv_bytes(64, chunk_tokens=64)
+                if self._prefill_memory_profile is not None
+                else self.estimate_block_memory(64)
+            )
             override_note = (
                 ", KV override "
                 f"{format_bytes(int(self._kv_bytes_per_token_override))}/tok"
@@ -597,7 +602,7 @@ class MemoryMonitor:
                 f"({self._num_kv_cache_layers} KVCache{rotating_note}), "
                 f"{num_kv_heads} KV heads, "
                 f"{self._num_attention_heads} Q heads, "
-                f"{head_dim} head_dim. Estimated memory per 64-token block: "
+                f"{head_dim} head_dim. Growing KV/index payload per 64 tokens: "
                 f"{format_bytes(sample_block_mem)}{override_note}"
             )
 
@@ -982,6 +987,31 @@ class MemoryMonitor:
             query_and_output = 2 * heads * n_tokens * dim * 4
             transient = max(transient, unpacked_kv + scores + query_and_output)
         return transient
+
+    def estimate_whole_prefill_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
+        """Bound every execution width/context in one prompt's prefill phase.
+
+        Native V4.1 scratch is not monotone at planner switches. Whole-phase
+        admission needs its range bound, while execution keeps the existing
+        exact next-chunk estimate. No model execution or per-token scan occurs.
+        Other model profiles retain their existing estimate.
+        """
+        profile = self._prefill_memory_profile
+        if isinstance(profile, _DeepSeekV41PrefillMemoryProfile):
+            return profile.estimate_whole_prefill_transient_bytes(n_tokens, kv_len)
+        return self.estimate_chunk_transient_bytes(n_tokens, kv_len)
+
+    def prefill_prediction_components(self, n_tokens: int, kv_len: int) -> dict:
+        """Expose charged scratch separately from logical growing KV payload."""
+        profile = self._prefill_memory_profile
+        if isinstance(profile, _DeepSeekV41PrefillMemoryProfile):
+            return profile.prediction_components(n_tokens, kv_len)
+        return {
+            "profile": type(profile).__name__ if profile is not None else "generic",
+            "transient_bytes": self.estimate_chunk_transient_bytes(n_tokens, kv_len),
+            "logical_kv_growth_bytes": int(self.estimate_prompt_kv_bytes(n_tokens)),
+            "native_attention_workspace": False,
+        }
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -1710,6 +1740,46 @@ class _DeepSeekV41PrefillMemoryProfile:
     hc_mult: int
     resident_kv_bytes_per_token: int
     dtype_size: float
+    allocation_slots: tuple = ()  # (compression ratio, packed bytes per row)
+    metadata_workspace_bytes: int = 0
+    native_attention: Any = None
+    ced_prefill: bool = False
+    candidate_topk_blocks: int = 0
+    candidate_block_size: int = 0
+
+    def index_workspace_upper_bound(self, query_tokens: int, kv_len: int) -> int:
+        tail = min(query_tokens, self.window_size) if self.ced_prefill else query_tokens
+        source = _v41_index_workspace_bytes(query_tokens, kv_len, self.index_topk)
+        midpoint = 0
+        candidates = 0
+        if self.candidate_topk_blocks and self.candidate_block_size:
+            midpoint = _v41_index_workspace_bytes(
+                tail, kv_len, self.index_topk, block_count=self.candidate_topk_blocks,
+                block_size=self.candidate_block_size)
+            candidates = 6 * tail * min(
+                self.candidate_topk_blocks * self.candidate_block_size, kv_len) * 4
+        return max(source, midpoint, candidates)
+
+    def native_workspace(self, query_tokens: int, kv_len: int) -> dict | None:
+        descriptor = self.native_attention
+        if (not isinstance(descriptor, dict) or descriptor.get("abi") != 1
+                or descriptor.get("bf16_gpu") is not True
+                or descriptor.get("batch_size") != 1
+                or descriptor.get("num_heads") != 64
+                or descriptor.get("head_dim") != 512
+                or descriptor.get("ced_program") != "canonical-8192"
+                or not callable(descriptor.get("workspace"))):
+            return None
+        try:
+            result = descriptor["workspace"](query_tokens, kv_len)
+        except (ValueError, TypeError, RuntimeError, OverflowError):
+            return None
+        fields = ("attention_scratch_bytes", "index_scratch_bytes", "pipeline_overlap_bytes")
+        if (not isinstance(result, dict) or result.get("abi") != 1
+                or any(type(result.get(name)) is not int or result[name] < 0 for name in fields)
+                or result["attention_scratch_bytes"] > 80 * 1024**2):
+            return None
+        return result
 
     def estimate_resident_kv_bytes(
         self, num_tokens: int, *, chunk_tokens: int = 1
@@ -1718,11 +1788,12 @@ class _DeepSeekV41PrefillMemoryProfile:
             return 0
         return int(self.resident_kv_bytes_per_token) * int(num_tokens)
 
-    def estimate_prefill_transient_bytes(
+    def prediction_components(
         self, query_tokens: int, kv_len: int
-    ) -> int:
+    ) -> dict:
         if query_tokens <= 0 or kv_len <= 0:
-            return 0
+            return {"profile": "deepseek_v41", "transient_bytes": 0,
+                    "logical_kv_growth_bytes": 0, "native_attention_workspace": False}
         query_tokens = int(query_tokens)
         head_width = self.num_attention_heads * self.head_dim
         # q latent -> per-head expansion, plus the mirrored output stream
@@ -1732,6 +1803,7 @@ class _DeepSeekV41PrefillMemoryProfile:
         # bf16; the native kernel streams this below the charge.
         selected = min(self.index_topk, int(kv_len)) + self.window_size
         gather = query_tokens * selected * self.head_dim * self.dtype_size
+        native = self.native_workspace(query_tokens, int(kv_len))
         indexer = (
             query_tokens * self.index_n_heads * self.index_head_dim * self.dtype_size
         )
@@ -1748,13 +1820,144 @@ class _DeepSeekV41PrefillMemoryProfile:
             * (2 * self.moe_inter_dim + self.dim)
             * self.dtype_size
         )
-        return int(q_heads + gather + indexer + hc + moe)
+        # Exact metadata is decoded for one expert bank only during prefill;
+        # the short decode/verify path reads its dictionary directly.
+        metadata = self.metadata_workspace_bytes if query_tokens > 8 else 0
+        components = {
+            "query_output_bytes": int(q_heads),
+            "attention_gather_bytes": int(gather) if native is None else 0,
+            "native_attention_scratch_bytes": 0 if native is None else native["attention_scratch_bytes"],
+            "index_scratch_bytes": self.index_workspace_upper_bound(query_tokens, int(kv_len))
+            if native is None else native["index_scratch_bytes"],
+            "pipeline_overlap_bytes": int(query_tokens * self.hc_mult * (
+                self.dim * self.dtype_size + 4))
+            if native is None else native["pipeline_overlap_bytes"],
+            "index_projection_bytes": int(indexer), "hyperconnection_bytes": int(hc),
+            "moe_bytes": int(moe), "metadata_fallback_bytes": int(metadata),
+        }
+        return {**components, "profile": "deepseek_v41",
+                "transient_bytes": sum(components.values()),
+                "logical_kv_growth_bytes": self.estimate_resident_kv_bytes(query_tokens),
+                "native_attention_workspace": native is not None}
+
+    def estimate_prefill_transient_bytes(self, query_tokens: int, kv_len: int) -> int:
+        return self.prediction_components(query_tokens, kv_len)["transient_bytes"]
+
+    @staticmethod
+    def _index_scan_range_bound(queries, keys, count, *, block_count=0, block_size=0,
+                                score_elements=None):
+        """Upper-bound live scan buffers over a rectangle of query/key counts.
+
+        The planner's power-of-two tile is at least min(keys, max(1024,
+        2*selected)). Before selection saturates only one tile is needed;
+        afterwards its fixed tile width makes this bound monotone in keys.
+        """
+        if queries <= 0 or keys <= 0:
+            return 0
+        selected = min(count, keys)
+        tile = max(1024, 2 * selected)
+        tiles = max(1, (keys + tile - 1) // tile)
+        elements = queries * keys
+        if score_elements is not None:
+            elements = min(elements, score_elements)
+        scores = 2 * elements * 4
+        winners = 3 * queries * tiles * selected * 8
+        block_winners = 0
+        if block_count:
+            block_keys = (keys + block_size - 1) // block_size
+            selected_blocks = min(block_count, block_keys)
+            block_tile = max(1024, 2 * selected_blocks)
+            block_tiles = max(1, (block_keys + block_tile - 1) // block_tile)
+            block_winners = 3 * queries * block_tiles * selected_blocks * 8
+        return scores + winners + block_winners
+
+    @classmethod
+    def _index_workspace_range_bound(cls, queries, keys, count, *,
+                                     block_count=0, block_size=0):
+        """Bound workspace.py's scan/radix plans without enumerating chunks.
+
+        Short queries may scan all keys. Radix uses two score groups of at
+        most 64 MiB each (or one key per group for unusually large contexts).
+        Scan branches keep their query/key bounds independently, including
+        the midpoint's larger 128 by 262144 score workspace.
+        """
+        if queries <= 0 or keys <= 0:
+            return 0
+        ids = 6 * queries * (min(count, keys) + block_count) * 4
+        short = cls._index_scan_range_bound(
+            min(8, queries), keys, count, block_count=block_count, block_size=block_size)
+        peak = short
+        if queries > 8:
+            if not block_count:
+                scan = cls._index_scan_range_bound(
+                    min(512, queries), min(keys, 4095), count,
+                    score_elements=1048576)
+                scores = min(2 * queries * keys * 4, max(128 * 1024**2, 2 * keys * 4))
+                peak = max(peak, scan, scores)
+            else:
+                midpoint = cls._index_scan_range_bound(
+                    min(128, queries), min(keys, max(262144, block_size)), count,
+                    block_count=block_count, block_size=block_size)
+                peak = max(peak, midpoint)
+                if queries > 128:
+                    scan_queries = min(512, queries)
+                    scan = cls._index_scan_range_bound(
+                        scan_queries, min(keys, max(262144, block_size)), count,
+                        block_count=block_count, block_size=block_size,
+                        score_elements=max(1048576, scan_queries * block_size))
+                    peak = max(peak, scan)
+                if block_count <= 2048 and keys >= max(4096, block_count * block_size):
+                    # The 0.7.3 radix route also selects candidate-block maxima.
+                    # Bound group * keys first: groups target 64 MiB, but a
+                    # single very wide key row may exceed that target.
+                    elements = min(queries * keys, max(16 * 1024**2, keys))
+                    block_elements = ((elements + block_size - 1) // block_size
+                                      + min(queries, 1024))
+                    radix = 2 * elements * 4 + 3 * block_elements * 8
+                    peak = max(peak, radix)
+        return peak + ids
+
+    def whole_prefill_index_workspace_upper_bound(self, query_tokens, kv_len):
+        tail = min(query_tokens, self.window_size) if self.ced_prefill else query_tokens
+        source = self._index_workspace_range_bound(query_tokens, kv_len, self.index_topk)
+        midpoint = candidates = 0
+        if self.candidate_topk_blocks and self.candidate_block_size:
+            midpoint = self._index_workspace_range_bound(
+                tail, kv_len, self.index_topk, block_count=self.candidate_topk_blocks,
+                block_size=self.candidate_block_size)
+            candidates = 6 * tail * min(
+                self.candidate_topk_blocks * self.candidate_block_size, kv_len) * 4
+        return max(source, midpoint, candidates)
+
+    def estimate_whole_prefill_transient_bytes(self, query_tokens, kv_len):
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+        query_tokens = min(int(query_tokens), int(kv_len))
+        kv_len = int(kv_len)
+
+        def bound(width):
+            parts = self.prediction_components(width, kv_len)
+            total = parts["transient_bytes"] - parts["index_scratch_bytes"]
+            total += self.whole_prefill_index_workspace_upper_bound(width, kv_len)
+            if parts["native_attention_workspace"]:
+                # The allocation ABI drops this scratch abruptly to zero
+                # above 80 MiB. Earlier chunks may still need the full bound.
+                total -= parts["native_attention_scratch_bytes"]
+                largest_unique = (width + min(self.window_size, max(0, kv_len - width))
+                                  + max(1, kv_len)) * 512 * 2
+                total += min(80 * 1024**2, largest_unique) if width >= 256 else 0
+            return int(total)
+
+        # <=8-token tails use the fallback descriptor. Bound that route too,
+        # rather than assuming its transient profile scales with the wide one.
+        return max(bound(query_tokens), bound(min(8, query_tokens)))
 
 
 def _make_deepseek_v41_prefill_memory_profile(
     config: Any,
     *,
     compute_dtype_size: float,
+    deepseek_native_attention: Any = None,
 ) -> PrefillMemoryProfile | None:
     dim = _cfg_get(config, "dim")
     head_dim = _cfg_get(config, "head_dim")
@@ -1816,7 +2019,19 @@ def _make_deepseek_v41_prefill_memory_profile(
         if layer_id in kv_sources:
             per_token += index_latent // int(ratio)
 
+    metadata_workspace_bytes = _cfg_get(
+        config, "_native_metadata_prefill_transient_bytes", 0
+    )
+    if (not isinstance(metadata_workspace_bytes, int)
+            or isinstance(metadata_workspace_bytes, bool)
+            or metadata_workspace_bytes < 0):
+        raise ValueError("Invalid native metadata prefill workspace")
     return _DeepSeekV41PrefillMemoryProfile(
+        native_attention=deepseek_native_attention,
+        ced_prefill=bool(_cfg_get(config, "ced_prefill", False)),
+        candidate_topk_blocks=int(_cfg_get(config, "candidate_topk_blocks", 0) or 0),
+        candidate_block_size=int(_cfg_get(config, "candidate_block_size", 0) or 0),
+        metadata_workspace_bytes=metadata_workspace_bytes,
         num_attention_heads=int(n_heads),
         head_dim=int(head_dim),
         dim=int(dim),
@@ -1827,6 +2042,11 @@ def _make_deepseek_v41_prefill_memory_profile(
         n_activated_experts=int(n_activated),
         moe_inter_dim=int(moe_inter_dim),
         hc_mult=int(hc_mult),
+        allocation_slots=tuple(
+            (int(compress_ratios[layer]), width)
+            for layer in kv_sources
+            for width in ((kv_latent, index_latent) if layer in index_sources else (kv_latent,))
+        ),
         resident_kv_bytes_per_token=per_token,
         dtype_size=float(compute_dtype_size),
     )
@@ -1837,6 +2057,7 @@ def make_prefill_memory_profile(
     *,
     compute_dtype_size: float,
     wsdpa_dtype_supported: bool = False,
+    deepseek_native_attention: Any = None,
 ) -> PrefillMemoryProfile | None:
     """Build a model-specific prefill strategy when the uniform formulas fail."""
     model_type = str(_cfg_get(config, "model_type", "") or "")
@@ -1850,7 +2071,8 @@ def make_prefill_memory_profile(
         )
     if model_type.startswith("deepseek_v41"):
         return _make_deepseek_v41_prefill_memory_profile(
-            config, compute_dtype_size=compute_dtype_size
+            config, compute_dtype_size=compute_dtype_size,
+            deepseek_native_attention=deepseek_native_attention,
         )
     if not model_type.startswith("deepseek_v4"):
         return None

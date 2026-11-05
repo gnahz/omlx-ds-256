@@ -7,6 +7,8 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
+import os
+import logging
 from contextlib import nullcontext
 from functools import cache, lru_cache
 
@@ -27,6 +29,17 @@ from .activation import (
     quantize_swiglu_activation,
     rope_activation,
 )
+from . import native_metadata, native_gate_up
+from . import attn_fusions, attn_in, attn_out, decode_fusions, fast_rope, hc_fuse, woa_compact, moe_decode
+
+DS41_GATHER = os.environ.get("DS41_GATHER", "1") == "1"
+DS41_MHC = os.environ.get("DS41_MHC", "1") == "1"
+DS41_FAST_ROPE = os.environ.get("DS41_FAST_ROPE", "1") == "1"
+DS41_NATIVE_DECODE = os.environ.get("DS41_NATIVE_DECODE", "1") == "1"
+DS41_NATIVE_VERIFY = os.environ.get("DS41_NATIVE_VERIFY", "0") == "1"
+DS41_DECODE_ASYNC = int(os.environ.get("DS41_DECODE_ASYNC", "4"))
+DS41_PREFILL_POOL = int(float(os.environ.get("DS41_PREFILL_POOL_GIB", "3")) * 1024**3)
+DS41_PREFILL_PIPELINE = os.environ.get("DS41_PREFILL_PIPELINE", "1") == "1"
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
 from .head import project_logits
@@ -42,11 +55,63 @@ from .kernels import (
     packed_index_scores,
     packed_index_topk,
     packed_sparse_attention,
+    packed_index_workspace_bytes,
 )
 from .mtp import DSparkMixin
 from .packed_attention import nax_packed_sparse_attention
-from .quantization import QuantizedProjection, pack_activation, quantize_activation
+from .quantization import QuantizedEmbedding, QuantizedProjection, pack_activation, quantize_activation, quantize_attention_output
 from .routing import combine_sorted_experts
+
+logger = logging.getLogger(__name__)
+
+
+class _LayerExecution:
+    """Bound prefill intermediates while overlapping one layer with Python."""
+
+    def __init__(self, prefill):
+        self.prefill = prefill
+        self.in_flight = None
+        self.previous_limit = None
+        self.submitted = False
+
+    def __enter__(self):
+        if self.prefill and DS41_PREFILL_POOL:
+            self.previous_limit = mx.set_cache_limit(DS41_PREFILL_POOL)
+        return self
+
+    def drain(self):
+        if self.in_flight is not None:
+            mx.eval(*self.in_flight)
+            self.in_flight = None
+
+    def before_layer(self, index, config):
+        if index in config.index_source_layers:
+            self.drain()
+
+    def submit(self, h, pre, index):
+        if self.prefill:
+            if DS41_PREFILL_PIPELINE:
+                self.drain()
+                mx.async_eval(h, pre)
+                self.submitted = True
+                self.in_flight = (h, pre)
+            else:
+                mx.eval(h, pre)
+            if not DS41_PREFILL_POOL:
+                mx.clear_cache()
+        elif DS41_DECODE_ASYNC and (index + 1) % DS41_DECODE_ASYNC == 0:
+            mx.async_eval(h, pre)
+            self.submitted = True
+
+    def __exit__(self, kind, value, traceback):
+        try:
+            self.drain()
+            if kind is not None and self.submitted:
+                mx.synchronize()
+        finally:
+            if self.previous_limit is not None:
+                mx.set_cache_limit(self.previous_limit)
+                mx.clear_cache()
 
 
 @mx.compile
@@ -160,6 +225,10 @@ def rope(x, positions, config, compressed, inverse=False, quantize=False, heads_
         config.beta_slow,
     )
     cos, sin = _rope_table(params, _rope_positions(positions))
+    # Preserve the custom short-row RoPE path and its flag.
+    if (not heads_major and not quantize and DS41_FAST_ROPE
+            and fast_rope.supported_length(x, cos.shape[0], config.rope_head_dim)):
+        return fast_rope.partial_rope(x, cos, -sin if inverse else sin, config.rope_head_dim)
     if (
         mx.default_device() == mx.gpu
         and x.size
@@ -174,6 +243,27 @@ def rope(x, positions, config, compressed, inverse=False, quantize=False, heads_
         x = x.transpose(0, 2, 1, 3)
     out = _rope_apply(x, cos, sin, inverse)
     return quantize_activation(out) if quantize else out
+
+
+def rope_tables(start, length, config, compressed, inverse=False, step=1):
+    """Legacy short-row fusions consume the stable reference's host RoPE tables."""
+    params = (config.rope_head_dim,
+              config.compress_rope_theta if compressed else config.rope_theta,
+              config.original_seq_len if compressed else 0, config.rope_factor,
+              config.beta_fast, config.beta_slow)
+    cos, sin = _rope_table(params, (start * step, (start + length) * step, step))
+    return cos, -sin if inverse else sin, config.rope_head_dim
+
+
+def _prequantized(projection):
+    return isinstance(projection, QuantizedProjection) and projection.quantize_input
+
+
+def _memo(shared, key, factory, *args):
+    value = shared.get(key)
+    if value is None:
+        value = shared[key] = factory(*args)
+    return value
 
 
 def candidate_block_ids(scores, lengths, count, block):
@@ -282,8 +372,15 @@ class Indexer(nn.Module):
                 previous = growth.append(cache, 3, previous, key, kv_start // ratio)
             shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
-        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
-        q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
+        prequantized = shared.get("qr8")
+        q = (self.wq_b.project_quantized(prequantized[1])
+             if prequantized is not None and prequantized[0] is qr and _prequantized(self.wq_b)
+             else self.wq_b(qr))
+        q = q.reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+        if DS41_FAST_ROPE and attn_fusions.index_q_supported(q, c.rope_head_dim):
+            q = attn_fusions.index_q(q, *rope_tables(start, end-start, c, True))
+        else:
+            q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
         # Reference: weights_proj(x) * scale is a tensor of the activation dtype (bf16).
         weights = (
             self.weights_proj(x)
@@ -292,12 +389,11 @@ class Indexer(nn.Module):
         candidates = None
         if 0 <= c.candidate_source_layer < layer:
             blocks = shared["candidates"]
-            candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
-                c.candidate_block_size
-            )
-            candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
-                1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
-            )
+            def expand():
+                candidates = blocks[..., None] * c.candidate_block_size + mx.arange(c.candidate_block_size)
+                return mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
+                    1, x.shape[1], blocks.shape[-1] * c.candidate_block_size)
+            candidates = _memo(shared, ("candidate_ids", id(blocks)), expand)
         if candidates is None:
             idx, blocks = packed_index_topk(
                 q,
@@ -316,6 +412,8 @@ class Indexer(nn.Module):
             return idx
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
+        if x.shape[1] <= 8 and attn_fusions.select_supported(scores.shape[-1], count):
+            return attn_fusions.select_rows(scores, count, ids=candidates.astype(mx.int32))
         if x.shape[1] <= 8:
             return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
@@ -344,6 +442,9 @@ class Attention(nn.Module):
         if layer in c.index_source_layers:
             self.indexer = Indexer(c, layer)
 
+    def _output_heads(self, out):
+        return quantize_attention_output(out)
+
     def _input_projections(self, x):
         pair = dense_a8_pair(self.wq_a, self.wkv, x)
         if pair is not None:
@@ -359,24 +460,52 @@ class Attention(nn.Module):
             )
         return self.wq_a(x), self.wkv(x)
 
-    def __call__(self, x, cache, shared, start, ced_kv=None, ced_kv_start=None):
+    def __call__(self, x, cache, shared, start, ced_kv=None, ced_kv_start=None,
+                 *, projections=None, return_projected=False, prebuilt_end=None):
+        if prebuilt_end is not None:
+            raise ValueError("Prebuilt encoder replay is not a stable runtime path")
         c, layer = self._config, self._layer
         ratio, length = c.compress_ratios[layer], x.shape[1]
-        positions = mx.arange(start, start + length)
+        positions = _memo(shared, ("positions", start, length), mx.arange, start, start+length)
         rope_positions = range(start, start + length)
-        query, kv_input = self._input_projections(x)
-        qr = self.q_norm(query)
-        q = rope(
-            self.wq_b(qr).reshape(1, length, c.n_heads, c.head_dim),
-            rope_positions,
-            c,
-            bool(ratio),
-        )
-        new = pack_activation(rope(self.kv_norm(kv_input), rope_positions, c, bool(ratio)))
+        fuse = (attn_fusions.ENABLED and DS41_FAST_ROPE and length <= attn_fusions.MAX_ROWS
+                and x.dtype == mx.bfloat16 and mx.default_device() == mx.gpu)
+        q = None
+        if projections is None:
+            stash = shared.pop("attn_in_xq", None)
+            if stash is not None and stash[0] is x:
+                query, kv_input = attn_in.input_projections(stash[1], self.wq_a, self.wkv)
+            else:
+                query, kv_input = self._input_projections(x)
+            if fuse and _prequantized(self.wq_b) and attn_fusions.rms_supported(query, self.q_norm.weight):
+                qr, qr8 = attn_fusions.rms_quant(query, self.q_norm.weight, self.q_norm.eps, True)
+                shared["qr8"] = (qr, qr8)
+                if attn_in.wqb_rope_supported(self.wq_b, qr8, c.n_heads, c.head_dim, c.rope_head_dim):
+                    q = attn_in.wqb_rope(qr8, self.wq_b, *rope_tables(start, length, c, bool(ratio)),
+                                         c.n_heads, c.head_dim)
+                else:
+                    q_input = self.wq_b.project_quantized(qr8)
+            else:
+                qr = self.q_norm(query)
+                q_input = self.wq_b(qr)
+        else:
+            qr, kv_input, q_input = projections
+        if q is None:
+            q = rope(q_input.reshape(1, length, c.n_heads, c.head_dim), rope_positions, c, bool(ratio))
         old = cache[1]
         # CED clears the stale window whenever bounded replay skips tokens.
         old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
-        kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
+        if fuse and decode_fusions.DS41_DECODE_KERNELS_V2 and attn_fusions.kv_supported(kv_input, self.kv_norm.weight, old_len):
+            kv = attn_fusions.kv_rows(kv_input, self.kv_norm.weight, self.kv_norm.eps,
+                *rope_tables(start, length, c, bool(ratio)), old, old_len)
+        else:
+            rotated = rope(self.kv_norm(kv_input), rope_positions, c, bool(ratio))
+            if (decode_fusions.DS41_DECODE_KERNELS_V2 and length <= 8
+                    and rotated.shape[-1] % 32 == 0 and mx.default_device() == mx.gpu):
+                new = decode_fusions.pack_fp8(rotated)
+            else:
+                new = pack_activation(rotated)
+            kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         verify_state = getattr(cache, "_mtp_verify_state", None)
         if verify_state is not None:
             verify_state["window"] = kv
@@ -425,6 +554,13 @@ class Attention(nn.Module):
                     cache, 2, shared["kv"], compressed, kv_start // ratio
                 )
             ci, pooled = shared["idx"], shared["kv"]
+        native_route = attention_fast.deepseek_v41_packed_attention_route(
+            query_tokens=length, batch_size=q.shape[0], num_heads=c.n_heads,
+            head_dim=c.head_dim, is_gpu=mx.default_device() == mx.gpu,
+            is_bfloat16=q.dtype == mx.bfloat16, local_rows=kv.shape[1],
+            pooled_rows=pooled.shape[1], local_row_bytes=kv.shape[-1],
+            pooled_row_bytes=pooled.shape[-1], selected_rows=ci.shape[-1],
+            native_decode=DS41_NATIVE_DECODE, native_verify=DS41_NATIVE_VERIFY)
         out = nax_packed_sparse_attention(
             q,
             kv,
@@ -438,14 +574,15 @@ class Attention(nn.Module):
         )
         if out is not None:
             heads_major = True
-        elif (
-            length > 8
-            and c.n_heads == 64
-            and c.head_dim == 512
-            and q.dtype == mx.bfloat16
-            and attention_fast.has_symbol("packed_sparse_attention")
-        ):
-            out = attention_fast.packed_sparse_attention(
+        elif native_route is not None:
+            # The stable multi-query ABI deliberately excludes length one.
+            # The separately exported capability preserves the historical
+            # singleton/no-pooled native path without calling a stale binary.
+            native_attention = (
+                attention_fast.packed_sparse_attention_single_decode
+                if native_route == "single" else attention_fast.packed_sparse_attention
+            )
+            out = native_attention(
                 q.transpose(0, 2, 1, 3),
                 kv[:, None],
                 pooled,
@@ -459,18 +596,27 @@ class Attention(nn.Module):
             heads_major = True
         else:
             out = packed_sparse_attention(
-                q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5
+                q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5,
+                rope_tables=rope_tables(start, length, c, bool(ratio), inverse=True) if fuse else None,
             )
             heads_major = False
-        # DeepSeek-V4.1-Flash model.py Attention.forward (1017, and the current Flash repo):
-        # "quantize/dequantize o before einsum", act_quant(o, 32, ue8m0, inplace=True) over
-        # each group's values. At df42c109 it fed bf16 o to wo_a directly, as upstream oMLX did.
-        # The 32-groups of a head's o equal those of o.reshape(1, length, o_groups, -1).
-        grouped = rope(
-            out, rope_positions, c, bool(ratio), inverse=True, quantize=True, heads_major=heads_major
-        ).reshape(1, length, c.o_groups, -1)
+            if fuse:
+                rope_positions = None
+        # The native and NAX paths return heads-major output; fused fallback
+        # already applied inverse RoPE. Preserve the custom output quantizer.
+        if rope_positions is not None:
+            out = rope(out, rope_positions, c, bool(ratio), inverse=True,
+                       heads_major=heads_major)
+        grouped = self._output_heads(out).reshape(1, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
-        return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
+        if decode_fusions.grouped_gemv_supported(grouped, weight):
+            if not return_projected and attn_out.supported(self.wo_b, grouped, weight):
+                return self.wo_b.project_quantized(
+                    attn_out.grouped_gemv_q(self.wo_a, grouped, weight).flatten(-2))
+            projected = woa_compact.grouped_gemv(self.wo_a, grouped, weight).flatten(-2)
+        else:
+            projected = mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2)
+        return projected if return_projected else self.wo_b(projected)
 
 
 class Expert(nn.Module):
@@ -498,7 +644,7 @@ class Expert(nn.Module):
             for p in (self.w1, self.w3)
         )
 
-    def __call__(
+    def _ordinary_call(
         self,
         x,
         indices=None,
@@ -506,6 +652,7 @@ class Expert(nn.Module):
         sorted_indices=False,
         *,
         input_quantized=False,
+        max_grouped_tokens=8,
     ):
         if input_quantized and not self.quantizes_input:
             raise ValueError(
@@ -531,7 +678,7 @@ class Expert(nn.Module):
                 and p.quantize_input
                 for p in projections
             )
-            and 1 <= x.size // self.w1.input_dims <= 8
+            and 1 <= x.size // self.w1.input_dims <= min(32, max_grouped_tokens)
             and x.size // self.w1.input_dims == indices.size // indices.shape[-1]
             and indices.size > 0
             and weights.size == indices.size
@@ -688,6 +835,18 @@ class Expert(nn.Module):
         return project(self.w2, y.astype(dtype))
 
 
+    def __call__(self, x, indices=None, weights=None, sorted_indices=False, *,
+                 input_quantized=False, max_grouped_tokens=8):
+        if getattr(self, "_native_metadata", False):
+            return native_metadata.compact_expert(
+                type(self)._ordinary_call, self, x, indices, weights,
+                sorted_indices, input_quantized=input_quantized,
+                max_grouped_tokens=max_grouped_tokens)
+        return self._ordinary_call(x, indices, weights, sorted_indices,
+                                   input_quantized=input_quantized,
+                                   max_grouped_tokens=max_grouped_tokens)
+
+
 class Gate(nn.Module):
     def __init__(self, c):
         super().__init__()
@@ -729,7 +888,7 @@ class MoE(nn.Module):
         )
         self._a8_min_tokens = c.a8_prefill_min_tokens if c.a8_prefill else None
 
-    def __call__(self, x, image_mask):
+    def _ordinary_call(self, x, image_mask):
         idx, weights = self.gate(x, image_mask)
         routed_quantized = self.experts.quantizes_input
         shared_quantized = self.shared_experts.quantizes_input
@@ -782,9 +941,19 @@ class MoE(nn.Module):
             shared = self.shared_experts(
                 quantized if shared_quantized else x, input_quantized=shared_quantized
             )
+        if x.dtype == mx.bfloat16:
+            combined = moe_decode.combine(routed, shared)
+            if combined is not None:
+                return combined
         return (routed.astype(mx.float32).sum(-2) + shared.astype(mx.float32)).astype(
             x.dtype
         )
+
+
+    def __call__(self, x, image_mask):
+        if getattr(self.experts, "_native_metadata", False):
+            return native_metadata.compact_moe(type(self)._ordinary_call, self, x, image_mask)
+        return self._ordinary_call(x, image_mask)
 
 
 # Each cross-rank transfer finishes on the host before GPU work reads it. A
@@ -835,6 +1004,12 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
 
 def hc_mixes(x, fn, scale, base, c):
     # One row keeps the FP32 GEMV. Multi-row MLX matmuls run at TF32 on M5.
+    if (DS41_MHC and x.dtype == mx.bfloat16 and x.ndim == 4
+            and 1 <= x.shape[1] <= 8 and x.shape[-2] == c.hc_mult == 4
+            and fn.dtype == mx.float32 and fn.shape == (24, 4*x.shape[-1])
+            and mx.default_device() == mx.gpu):
+        mixes = decode_fusions.hc_project(x, fn, c.norm_eps)
+        return decode_fusions.mix_sinkhorn(mixes, scale, base, c.hc_eps, c.hc_sinkhorn_iters)
     if (
         x.ndim == 4
         and x.shape[1] >= 2
@@ -902,6 +1077,8 @@ def hc_post(x, residual, post, comb):
     return _hc_post_reference(x, residual, post, comb)
 
 
+
+
 class Block(nn.Module):
     # Set on tensor-parallel ranks, whose sublayers return partial sums.
     _tensor_group = None
@@ -943,6 +1120,9 @@ class Block(nn.Module):
             and getattr(cache, "_mtp_verify_state", None) is not None
         ):
             return decode_fused.decode_block_verify(self, h, pre, cache, shared, start, self._config)
+        if (DS41_MHC and ced_tail is None and self._tensor_group is None
+                and hc_fuse.eligible(self, h, pre, 0)):
+            return hc_fuse.block_forward(self, h, pre, cache, shared, start, image_mask)
         ced_kv = ced_kv_start = None
         if ced_tail is not None:
             # CED bounded replay: queries, SWA KV and MoE run on the tail
@@ -1033,6 +1213,77 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         self.configure_mtp(config.preserve_mtp and is_mtp_active(), get_mtp_depth())
         self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
+    @property
+    def _omlx_preserve_prefill_chunks(self):
+        # Exact CED checkpoints certify one chunk program; contention cannot change it.
+        return bool(self._config.ced_prefill)
+
+    def _omlx_native_prefill_workspace_descriptor(self):
+        """Runtime-qualified, metadata-only plan; unsupported paths stay generic."""
+        c = self._config
+        if (os.environ.get("DS41_NATIVE_PREFILL_WORKSPACE", "0") != "1"
+                or not c.ced_prefill or not c.ced_layout_supported()
+                or self.pipeline_size != 1 or c.index_head_dim != 128
+                or c.index_n_heads != 32
+                or any(layer._tensor_group is not None for layer in self.layers)
+                or (c.candidate_source_layer >= 0
+                    and c.candidate_source_layer < c.n_layers // 2)):
+            return None
+        # Packed vocabulary storage is U32, but affine embedding output follows
+        # its scale dtype. Prove that known implementation's actual output type
+        # without evaluating a lookup or touching model payloads.
+        embedding = self.embed
+        output_dtype = None
+        if isinstance(embedding, QuantizedEmbedding):
+            if (embedding.mode == "affine" and not embedding.quantize_input
+                    and embedding.scales.dtype == embedding.biases.dtype):
+                output_dtype = embedding.scales.dtype
+        elif isinstance(embedding, nn.Embedding):
+            output_dtype = embedding.weight.dtype
+        native = attention_fast.deepseek_v41_prefill_workspace_descriptor(
+            batch_size=1, num_heads=c.n_heads, head_dim=c.head_dim,
+            is_gpu=mx.default_device() == mx.gpu,
+            is_bfloat16=output_dtype == mx.bfloat16)
+        if native is None:
+            return None
+
+        def workspace(query_tokens, kv_len):
+            if (type(query_tokens) is not int or type(kv_len) is not int
+                    or query_tokens <= 8 or kv_len < query_tokens):
+                return None
+            start = kv_len - query_tokens
+            attention = index = 0
+            midpoint = c.n_layers // 2
+            tail = min(query_tokens, c.window_size)
+            for layer, ratio in enumerate(c.compress_ratios[:c.n_layers]):
+                queries = query_tokens if layer < midpoint else tail
+                pooled = kv_len // ratio if ratio else 0
+                plan = native["workspace"](
+                    queries, queries + min(c.window_size, start), pooled)
+                if plan is None:
+                    return None
+                attention = max(attention, plan["scratch_bytes"])
+                if layer in c.index_source_layers:
+                    blocks = c.candidate_topk_blocks if layer == c.candidate_source_layer else 0
+                    if 0 <= c.candidate_source_layer < layer:
+                        candidates = min(c.candidate_topk_blocks * c.candidate_block_size, pooled)
+                        # Expanded IDs, score array, sort order, masks and final IDs.
+                        charge = 6 * queries * candidates * 4
+                    else:
+                        charge = packed_index_workspace_bytes(
+                            queries, pooled, c.index_topk, block_count=blocks,
+                            block_size=c.candidate_block_size)
+                    index = max(index, charge)
+            # One predecessor's h/pre may overlap construction of the next
+            # layer. Charge this explicitly in addition to the legacy HC term.
+            overlap = query_tokens * c.hc_mult * (c.dim * 2 + 4)
+            return {"abi": 1, "attention_scratch_bytes": attention,
+                    "index_scratch_bytes": index,
+                    "pipeline_overlap_bytes": overlap}
+
+        return {**native, "workspace": workspace, "bf16_gpu": True,
+                "ced_program": "canonical-8192"}
+
     def make_dspark_cache(self):
         from .dspark import make_cache
 
@@ -1052,6 +1303,31 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
     def set_token_map(self, token_map):
         if self._config.engram_layer_ids:
             self._hasher = NgramHash(self._config, token_map)
+
+    def prefetch_ple(self, next_ids, current_ids):
+        """Gather the following chunk's Engram rows while this chunk runs."""
+        prefetch = getattr(self, "_engram_prefetch", None)
+        c = self._config
+        if prefetch is None or self._hasher is None or not c.engram_layer_ids:
+            return
+        try:
+            upcoming = np.asarray(next_ids, dtype=np.int64)
+            current = np.asarray(current_ids, dtype=np.int64)
+            if upcoming.ndim != 2 or upcoming.shape[0] != 1 or not upcoming.shape[1]:
+                return
+            depth = c.engram_max_ngram_size - 1
+            history = None
+            if current.shape[1] >= depth:
+                history = self._hasher.token_map[current[:, current.shape[1]-depth:]]
+            elif current.shape[1]:
+                return
+            hashes, _ = self._hasher(upcoming, history)
+            for ix, layer_id in enumerate(c.engram_layer_ids):
+                if self.start_idx <= layer_id < self.start_idx + len(self.pipeline_layers):
+                    prefetch.submit(self.layers[layer_id].engram.embed, hashes[:, :, ix],
+                        lookahead=True, warm_rows=not current.shape[1] and upcoming.shape[1] >= 256)
+        except Exception:
+            logger.debug("Engram lookahead skipped", exc_info=True)
 
     def make_cache(self):
         return [
@@ -1151,7 +1427,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         x = self.norm(hc_pre(h, pre))
         if self.pipeline_size > 1:
             x = _gather_stage(x)
-        return x if skip_logits else project_logits(x, self.head.weight)
+        return x if skip_logits else project_logits(x, self.head)
 
     def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
         """One token per request at a valid position, through supported fused layers.
@@ -1333,6 +1609,16 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         capture = bool(kwargs.get("return_dspark_hidden", False))
         if self._batched_decode_ok(input_ids, cache, masks, inputs_embeds, capture, kwargs):
             return self._forward_decode_batched(input_ids, cache, skip_logits)
+        if (os.environ.get("DS41_BATCH_DECODE", "1") == "1"
+                and self.pipeline_size == 1 and not skip_logits
+                and all(layer._tensor_group is None for _, layer in stage)
+                and 1 < input_ids.shape[0] <= 8 and input_ids.shape[1] == 1
+                and (masks is None or bool(np.all(np.asarray(masks))))
+                and not capture and inputs_embeds is None
+                and kwargs.get("mtp_verify_states") is None
+                and all(not item.empty() for item in cache)):
+            from .batched_decode import forward
+            return forward(self, input_ids, cache)
         if capture and input_ids.shape[0] != 1:
             raise ValueError(
                 "DSpark target capture currently requires one unpadded row"
@@ -1441,14 +1727,15 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # CED tail and 2047/2048 chunk widths, so size classes never
             # reuse). Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
-            with prefetch.forward() if prefetch is not None else nullcontext():
-                first = self._next_engram(stage, -1)
-                if prefetch is not None and first is not None:
-                    prefetch.submit(
-                        self.layers[first].engram.embed,
-                        hashes[:, :, engram_ids.index(first)],
-                    )
+            with (
+                prefetch.forward() if prefetch is not None else nullcontext()
+            ), _LayerExecution(prefill_backpressure) as execution:
+                if prefetch is not None:
+                    for ix, layer_id in enumerate(c.engram_layer_ids):
+                        if self.start_idx <= layer_id < self.start_idx + len(stage):
+                            prefetch.submit(self.layers[layer_id].engram.embed, hashes[:, :, ix])
                 for j, (i, layer) in enumerate(stage):
+                    execution.before_layer(i, c)
                     if "engram" in layer:
                         ix = engram_ids.index(i)
                         if prefetch is not None:
@@ -1491,12 +1778,9 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 shared.get("candidates", mx.zeros((1, 0, 0), mx.int32)),
                             )
                         )
-                    if prefill_backpressure:
-                        mx.eval(h, pre)
-                        mx.clear_cache()
-                    else:
-                        # The GPU runs this layer while the next one is built.
+                    if prefetch is not None and "engram" in layer:
                         mx.async_eval(h, pre)
+                    execution.submit(h, pre, i)
                     rc[j][0] = mx.array([start + end - begin], mx.int32)
                     if history is not None and j == 0:
                         rc[j][6] = mx.array(history, mx.int64)

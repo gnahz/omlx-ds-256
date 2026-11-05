@@ -101,7 +101,7 @@ def test_skipped_decoder_tail_keeps_dspark_priming(follow):
         model._omlx_prefill(first, cache=cache, next_prefill_tokens=announced)
         assert cache[3].has_pending() == bool(announced)
         model._omlx_prefill(nxt, cache=cache)
-        context = model._omlx_mtp_prime_ctx
+        context = cache[0]._omlx_mtp_prime_ctx
         offset = context.expected_target_offset
         keys = [np.asarray(c.keys.astype(mx.float32)) for c in context.caches]
         logits = np.asarray(model(mx.array([[30]]), cache=cache))
@@ -168,7 +168,9 @@ def test_dspark_ring_and_rollback_after_ced_prefill():
     cache = model.make_cache()
     for start, count in [(0, 13), (13, 9), (22, 2)]:
         model._omlx_prefill(mx.array([[3 + i % 20 for i in range(count)]]), cache=cache)
-        context = model._omlx_mtp_prime_ctx
+        # DSpark priming state is per request: it lives on the request cache when the model owns it there.
+        owner = cache[0] if getattr(model, "_omlx_dspark_cache_owned", False) else model
+        context = owner._omlx_mtp_prime_ctx
         assert context.expected_target_offset == start + count
         assert all(
             c.offset == start + count and c.keys.shape[2] == 4 for c in context.caches

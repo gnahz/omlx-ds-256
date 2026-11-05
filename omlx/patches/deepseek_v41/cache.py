@@ -85,6 +85,7 @@ class DeepseekV41Cache(ArraysCache):
             self._ds41_buffers = {}
         row.cache = list(self.cache)
         row._ds41_buffers = self._ds41_buffers
+        row._omlx_mtp_prime_ctx = getattr(self, "_omlx_mtp_prime_ctx", None)
         return row
 
     def _as_rows(self):
@@ -238,12 +239,12 @@ class DeepseekV41Cache(ArraysCache):
         self.cache, self.left_padding, self.lengths = v
         self._lp = self._len = None
 
-    def extract(self, idx):
+    def extract(self, idx, *, offset=None):
         if self._rows is not None:
             return self._rows[idx]._row_copy()
-        return self._dense_extract(idx)
+        return self._dense_extract(idx, offset=offset)
 
-    def _dense_extract(self, idx):
+    def _dense_extract(self, idx, *, offset=None):
         result = type(self)(self.compress_ratio)
         if self.batch_size == 1 and idx in (0, -1):
             # Forward passes run on extracted rows. Share the arrays and the
@@ -256,13 +257,14 @@ class DeepseekV41Cache(ArraysCache):
             result.cache = [
                 x[idx : idx + 1] if x is not None else None for x in self.cache
             ]
+        result._omlx_mtp_prime_ctx = getattr(self, "_omlx_mtp_prime_ctx", None)
         ratio = self.compress_ratio
         if result.cache[0] is None or ratio is None:
             return result
         # extend() pads every slot to the widest row; a padded row fails the
         # cumulative-state checks in the prefix cache, so trim to this row's
         # own offset. The window keeps min(offset, width) rows.
-        offset = int(result.cache[0].item())
+        offset = int(result.cache[0].item()) if offset is None else int(offset)
         limits = {
             1: offset,
             2: offset // ratio if ratio else 0,

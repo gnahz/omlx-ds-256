@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "repo_id": "gnahzhang/DeepSeek-V4.1-Flash-1017-LSQ3-G128-MLX",
+  "revision": "c98bd97baca052f484c1d6ea6b6e8a8eced404ef",
+  "url": "https://huggingface.co/gnahzhang/DeepSeek-V4.1-Flash-1017-LSQ3-G128-MLX/tree/c98bd97baca052f484c1d6ea6b6e8a8eced404ef",
+  "upstream_repo_id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "upstream_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "total_download_bytes": 451545163672,
+  "checkpoint_tensor_files": 130,
+  "exact_metadata_tensor_files": 120,
+  "exact_metadata_saved_resident_bytes": 8483059248,
+  "sha256": {
+    "config.json": "c8b55a23c2449a389d61a8480f4777365b5d137d2297ab7f8e8550987b125d6c",
+    "model.safetensors.index.json": "64af4d5abe2bd91bb4053ded936ea83ec4fbc1360c0046e587611883cb9f42f6",
+    "ds41-conversion.json": "8c7395d1ac09962b20c12d35cdd85540638c3383e97c1004c6303b986829eeac",
+    "release-manifest.json": "e1b29caac4785ed03c6e9d742d62eeb0201c0e405b20d93bae6db78044e03e64",
+    "SHA256SUMS": "0b1cbb6001582b1b196119b093d6446bc02f24723cc6a2168b4dfce049838fca",
+    "exact-metadata/metadata-proof.json": "b0618dcafb6c03c9de4015cbd485d95f3236472477096f07e240209880412dbb",
+    "exact-metadata/DeepSeek-V4.1-LSQ3-G128-exact-metadata.json": "24a673c2dbcbf6a20e303f2701db6b8d46e445ca9c652bdd9ad5738b3d8f615b"
+  },
+  "required_model_type": "deepseek_v41",
+  "required_attention_output_quantization": true,
+  "notes": [
+    "This is the 1017 update, not the older DeepSeek-V4.1-Flash-LSQ3-G128-MLX checkpoint.",
+    "Download includes the original Engram shards, vision and all three MTP stages, plus the exact scale/bias dictionary overlay.",
+    "The public runtime-bundle describes an older serving release. Use this repository's deployment scripts for oMLX 0.7.3.",
+    "Exact-metadata payloads are already published. Local preparation pins their filesystem identities without requantizing or reading complete model weights."
+  ]
+}

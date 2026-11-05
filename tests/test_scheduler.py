@@ -479,10 +479,13 @@ class TestSchedulerAddRequest:
             prompt="Hello, world!",
             sampling_params=SamplingParams(max_tokens=50),
         )
+        before_enqueue = scheduler.snapshot_for_admin()
         scheduler.add_request(request)
 
         assert "test-001" in scheduler.requests
         assert request in scheduler.waiting
+        assert before_enqueue["waiting"] == []
+        assert scheduler.snapshot_for_admin()["waiting"] == [request]
         assert request.prompt_token_ids is not None
         assert len(request.prompt_token_ids) > 0
         assert request.num_prompt_tokens == len(request.prompt_token_ids)
@@ -8071,6 +8074,25 @@ class TestStopStringOutputBuffer:
         scheduler.uid_to_request_id[99] = request.request_id
         scheduler.request_id_to_uid[request.request_id] = 99
         return scheduler
+
+    def test_recent_decode_rate_counts_recorded_batch_tokens(
+        self, mock_model, monkeypatch
+    ):
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.reset_decode_rate(10.0)
+        monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 12.0)
+
+        scheduler._process_batch_responses(
+            [self._response(10), self._response(10), self._response(10)]
+        )
+        assert request.num_output_tokens == 3
+        assert request.recent_decode_tokens_per_second(12.0) == 1.5
+
+        monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 13.0)
+        scheduler._process_batch_responses([self._response(10, finish_reason="stop")])
+        assert request.num_output_tokens == 3
+        assert request.recent_decode_tokens_per_second(15.0) == 0.0
 
     def test_matched_stop_sequence_is_absent_from_stream_and_final_text(
         self, mock_model

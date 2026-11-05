@@ -139,6 +139,11 @@
             <span class="min-w-0 break-words"
                   x-text="window.t('status.runtime_cache.ssd_unavailable').replace('{path}', stats.runtime_cache?.ssd_cache_dir || '')"></span>
         </div>
+        <div x-show="stats.runtime_cache?.backend === 'deepseek_v41_exact_l2_v1'" x-cloak
+             class="text-xs text-neutral-600 bg-amber-50 border border-amber-100 rounded-lg p-3">
+            <strong>Exact CED · RAM + SSD L2</strong>
+            <span class="ml-2">RAM capacity is fixed by the service profile. SSD capacity uses the native cache setting. Clearing RAM preserves SSD; clearing SSD preserves RAM.</span>
+        </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
             <div>
                 <div class="text-neutral-400 mb-1">{{ t('status.runtime_cache.active_base_path') }}</div>
@@ -207,6 +212,11 @@
                         <tr>
                             <td class="px-3 py-2 font-medium">
                                 <span x-text="m.id"></span>
+                                <div x-show="m.cache_tier === 'deepseek-exact-l2'" x-cloak class="text-caption font-normal text-neutral-500 mt-0.5">
+                                    <span x-text="m.backend"></span>
+                                    <div x-text="'SSD hits ' + formatNumber(m.hits || 0) + ' · misses ' + formatNumber(m.misses || 0) + ' · reads ' + formatNumber(m.loads || 0) + ' (' + formatSizeBytes(m.read_bytes || 0) + ') · writes ' + formatNumber(m.saves || 0) + ' (' + formatSizeBytes(m.write_bytes || 0) + ') · pending ' + formatSizeBytes(m.pending_bytes || 0)"></div>
+                                    <span>Read/write bytes count file operations; OS page cache may serve reads.</span>
+                                </div>
                                 <span x-show="m.cache_tier === 'splash'" x-cloak
                                       class="badge ml-1.5 bg-neutral-100 text-neutral-600 border-neutral-200"
                                       x-text="window.t('status.runtime_cache.splash_badge')"></span>
@@ -227,7 +237,7 @@
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
-                                    <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
+                                    <span x-show="!m.has_sub_block_cache" x-text="m.cache_tier === 'deepseek-exact-l2' ? formatNumber(m.exact_prefix_cache?.checkpoints || 0) + ' checkpoints' : formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
                                     <span x-show="m.has_sub_block_cache" class="font-medium text-amber-700" x-text="m.indexed_blocks_display + ' tks'"></span>
                                 </td>
                             </template>

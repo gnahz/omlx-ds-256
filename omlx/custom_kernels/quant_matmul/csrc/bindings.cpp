@@ -12,6 +12,7 @@
 #include "command_queue.h"
 #include "gather_qmm.h"
 #include "grouped_expert.h"
+#include "deepseek_v41_joint_metadata.h"
 #include "head_flat_qmm.h"
 #include "moe_weighted_sum.h"
 #include "mxfp8_qmv.h"
@@ -39,6 +40,10 @@ NB_MODULE(_ext, m) {
         return static_cast<int64_t>(a.size());
       },
       "a"_a);
+  m.def("deepseek_v41_joint_metadata_gather_qmm",
+        &omlx::quant_matmul::deepseek_v41_joint_metadata_gather_qmm,
+        "x"_a, "weight"_a, "joint_words"_a, "joint_dictionary"_a,
+        "lhs_indices"_a, "rhs_indices"_a, "stream"_a = nb::none());
   m.def("grouped_expert",
         &omlx::quant_matmul::grouped_expert,
         "gate"_a, "up"_a, "activation"_a, "down"_a);

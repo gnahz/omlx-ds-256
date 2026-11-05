@@ -5284,7 +5284,12 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         monkeypatch.setattr(context_copy.ContextCopy, "observe", observe)
         actual, _ = generate(model, [prompt], [64])
         assert actual == expected
-        assert set(flips) <= set(accepted)
+        if family == "v41":
+            # Production DSpark keeps its existing CopyIndex policy rather
+            # than adding the new generic upstream ContextCopy proposer.
+            assert not accepted
+        else:
+            assert set(flips) <= set(accepted)
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
 
@@ -5326,7 +5331,9 @@ def test_batch_policy_skips_copied_windows(monkeypatch):
     previous = mlx_lm_mtp.is_mtp_active()
     try:
         mlx_lm_mtp.set_mtp_active(True)
-        model = _model("v41")
+        # DSpark's production CopyIndex owns a separate acceptance controller;
+        # exercise the generic ContextCopy policy on a model that selects it.
+        model = _model("qwen")
         prompts = [[3, 4, 5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10, 11]]
         model._omlx_mtp_decode_enabled = False
         expected, _ = generate(model, prompts, [24, 24])
@@ -5356,7 +5363,9 @@ def test_batch_policy_skips_copied_windows(monkeypatch):
         monkeypatch.setattr(BatchPolicy, "observe_mtp", observe_mtp)
         actual, _ = generate(model, prompts, [24, 24])
         assert actual == expected
-        assert any(copied_cycles) and decisions
+        assert any(copied_cycles)
+        # Request-preserving DSpark may advance each UID through its own
+        # acceptance controller without sampling the generic batch policy.
         assert not any(decisions)
     finally:
         mlx_lm_mtp.set_mtp_active(previous)

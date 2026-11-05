@@ -38,7 +38,10 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.32.4; optional custom kernels live under
+    # Base MLX ABI is v0.32.4. The DeepSeek deployment builds the pinned
+    # custom MLX patch via deploy/deepseek/bootstrap.sh; this version
+    # requirement alone does not reproduce that patched build.
+    # Optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).

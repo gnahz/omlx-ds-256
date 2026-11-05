@@ -1,5 +1,7 @@
 #pragma once
 
+#include "packed_sparse_attention_plan.h"
+
 #include "mlx/array.h"
 #include "mlx/stream.h"
 #include "mlx/utils.h"
@@ -9,6 +11,18 @@ namespace mx = mlx::core;
 namespace omlx::attention {
 
 mx::array packed_sparse_attention(
+    const mx::array& q,
+    const mx::array& local_kv,
+    const mx::array& pooled,
+    const mx::array& topk_indices,
+    const mx::array& sinks,
+    float scale,
+    int q_offset,
+    int compress_ratio,
+    int local_window,
+    mx::StreamOrDevice s = {});
+
+mx::array packed_sparse_attention_single_decode(
     const mx::array& q,
     const mx::array& local_kv,
     const mx::array& pooled,

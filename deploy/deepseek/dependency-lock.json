@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "python": "3.13",
+  "scope": "Reproducibility pins for the customized DeepSeek source build. These are not a complete transitive dependency lock.",
+  "platform": {
+    "os": "macOS",
+    "architecture": "arm64"
+  },
+  "mlx": {
+    "repository": "https://github.com/ml-explore/mlx.git",
+    "revision": "36969c094354086e15d2a327a9c50feb20b9cf11",
+    "version": "0.32.4",
+    "patch": "patches/mlx-custom.patch",
+    "patch_sha256": "75f62529d63b811d06308f457064018c601984fdb599aa2874bc12afbf2fc6d9",
+    "license": "MIT",
+    "files": [
+      {
+        "path": "mlx/backend/metal/jit_kernels.cpp",
+        "sha256": "256353b2cf167e47c95e6ef1b923069545abdfaeef1149d85b409d5ab72dd025"
+      },
+      {
+        "path": "mlx/backend/metal/kernels.h",
+        "sha256": "23f89120f3c85849bd6315ca41c89ce7a38dc69c2095317d58825d3243977695"
+      },
+      {
+        "path": "mlx/backend/metal/kernels/quantized_nax.h",
+        "sha256": "45b1cd45ae09821115e1449c76eb026e752bae9a0bd3ff9104997e3fba9d5724"
+      },
+      {
+        "path": "mlx/backend/metal/kernels/quantized_nax.metal",
+        "sha256": "4338404821ab02e57dfba8d773e0e1aec5f47f31ff4326232fa2a484ac65bca4"
+      },
+      {
+        "path": "mlx/backend/metal/nojit_kernels.cpp",
+        "sha256": "89b35415c269ff1c8ddcd54c6290048c8bc6ef2f1cc62085c3ade71139f8e4f8"
+      },
+      {
+        "path": "mlx/backend/metal/quantized.cpp",
+        "sha256": "fe6f84841a3cdf792452bf148b4d47ef1fefc11f2351d76f0941f1561c69b1ad"
+      },
+      {
+        "path": "mlx/ops.cpp",
+        "sha256": "347c1d6fee67aced9a6dc95360ec13c575ccc25dd70e5a7ddca15fe48b450694"
+      },
+      {
+        "path": "python/src/ops.cpp",
+        "sha256": "d1a7c84804bd8d21a2c61425b545e3735449e23421f5a5930dac0764fcd717b7"
+      },
+      {
+        "path": "python/tests/test_quantized.py",
+        "sha256": "f1588733c1c8e983d4c32ac886e19fe9d49deb4bb9ddf127f0d2056fc0da5c42"
+      }
+    ]
+  },
+  "git_dependencies": {
+    "mlx-lm": {
+      "repository": "https://github.com/ml-explore/mlx-lm",
+      "revision": "0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
+      "version": "0.32.3.dev8+g0d4d3d04f"
+    },
+    "mlx-vlm": {
+      "repository": "https://github.com/Blaizzy/mlx-vlm",
+      "revision": "138d7617d39653b39a5cbc379b1b5907a4481d67",
+      "version": "0.7.11"
+    },
+    "mlx-embeddings": {
+      "repository": "https://github.com/Blaizzy/mlx-embeddings",
+      "revision": "32981fa4e8064ed664b52071789dd18271fe4206",
+      "version": "0.1.0"
+    },
+    "mlx-audio": {
+      "repository": "https://github.com/Blaizzy/mlx-audio",
+      "revision": "8c244a1faff44cfa69e3151c195f52a4c1c90be5",
+      "version": "0.6.3"
+    }
+  },
+  "build_packages": {
+    "setuptools": "84.2.0",
+    "cmake": "4.4.4",
+    "nanobind": "3.1.0",
+    "packaging": "26.3",
+    "typing-extensions": "4.16.0"
+  },
+  "runtime_packages": {
+    "numpy": "2.3.5",
+    "transformers": "5.17.0",
+    "tokenizers": "0.23.3",
+    "huggingface-hub": "1.33.0",
+    "fastapi": "0.154.0",
+    "torch": "2.14.1"
+  },
+  "build": {
+    "parallel_jobs": 2,
+    "deployment_target": "27.0",
+    "nax_minimum_sdk": "26.2",
+    "nax_minimum_deployment_target": "26.2",
+    "nax_metal_language": "4.0",
+    "custom_kernel_flag": "OMLX_WITH_CUSTOM_KERNEL=1"
+  },
+  "notes": [
+    "The patch includes all nine modified MLX source/test files from the local 0.7.3 DeepSeek environment; no compiled binaries are included.",
+    "Install the patched MLX source before building oMLX extensions. Use nanobind 3.1.0 for the shared MLX extension ABI.",
+    "The custom native build uses a macOS 27.0 deployment target. NAX also requires a compatible Apple GPU and a Metal 4 SDK; a successful source build alone does not prove NAX availability.",
+    "Do not replace this MLX build with the stock same-version wheel during dependency resolution or isolated native extension builds."
+  ]
+}

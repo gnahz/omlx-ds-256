@@ -80,6 +80,13 @@ class PrefillProgressTracker:
                 )
                 self._progress[request_id] = entry
 
+    def update_detail(self, request_id: str, detail: Optional[str]) -> None:
+        """Change a wait label without changing completed progress or timing."""
+        with self._lock:
+            entry = self._progress.get(request_id)
+            if entry is not None:
+                entry["detail"] = detail
+
     def remove(self, request_id: str) -> None:
         """Explicitly remove a request (e.g. on abort or finish)."""
         with self._lock:

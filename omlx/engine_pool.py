@@ -1006,7 +1006,19 @@ class EnginePool:
             estimate = deepseek_v41_residency_estimate(entry.model_path)
             if not estimate.supported:
                 return False, False, None
-            if getattr(settings, "moe_expert_offload_enabled", False):
+            from .patches.deepseek_v41.native_metadata import NativeMetadataPlan, enabled_proof
+            native_proof = enabled_proof()
+            if native_proof is not None:
+                if (getattr(settings, "moe_expert_offload_enabled", False)
+                        or not getattr(settings, "mtp_enabled", False)):
+                    raise ValueError("Native G128 metadata requires complete resident MTP and experts")
+                estimate = NativeMetadataPlan(
+                    entry.model_path, native_proof
+                ).residency_estimate(estimate)
+            if (
+                getattr(settings, "moe_expert_offload_enabled", False)
+                and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+            ):
                 from .patches.deepseek_v41.moe_offload import estimate_expert_savings
 
                 saved = estimate_expert_savings(
@@ -3339,7 +3351,8 @@ class EnginePool:
                         # loop re-measure.
                         reclaim_attempted = True
                         await self._reclaim_pooled_buffers_for_prefill(
-                            exclude_model_id, request_id
+                            exclude_model_id, request_id,
+                            predicted_bytes=predicted, target_bytes=target,
                         )
                         # Re-measure regardless of the reported delta: the
                         # helper reads the process-wide MLX pool, so
@@ -3452,7 +3465,8 @@ class EnginePool:
             return None
 
     async def _reclaim_pooled_buffers_for_prefill(
-        self, model_id: str, request_id: str
+        self, model_id: str, request_id: str, *,
+        predicted_bytes: int = 0, target_bytes: int = 0,
     ) -> int:
         """Return MLX's pooled Metal buffers to the OS; report bytes freed.
 
@@ -3497,7 +3511,13 @@ class EnginePool:
         def _reclaim_on_engine_thread() -> int:
             gc.collect()
             pooled = int(mx.get_cache_memory())
-            reclaim()
+            bounded_reclaim = getattr(
+                type(scheduler), "_reclaim_prefill_headroom_for_request", None,
+            )
+            if callable(bounded_reclaim) and target_bytes > 0:
+                bounded_reclaim(scheduler, predicted_bytes, target_bytes)
+            else:
+                reclaim()
             return max(0, pooled - int(mx.get_cache_memory()))
 
         loop = asyncio.get_running_loop()

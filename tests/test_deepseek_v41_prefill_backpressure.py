@@ -40,7 +40,10 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     stays pinned until the final logits eval and the pool hoards every size
     class — the measured +14.5GB/chunk flat sawtooth. The loop must eval the
     running (h, pre) stream per layer during prefill and clear the allocator
-    pool at the same boundaries; decode widths stay lazy for latency."""
+    pool at the same boundaries when the retained pool is disabled; decode
+    widths stay lazy for latency."""
+    # Production uses a bounded pool; exercise the uncached mode separately.
+    monkeypatch.setattr(v41_lang, "DS41_PREFILL_POOL", 0)
     model = v41_lang.LanguageModel(tiny())
     n_layers = model._config.n_layers
 
@@ -83,6 +86,36 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     real_eval(out)
     assert len(calls) < n_layers, "decode width must stay lazy (no per-layer eval)"
     assert not clears, "decode width must not clear the pool per layer"
+
+
+def test_v41_prefill_bounded_pool_drains_before_reuse_and_restores_limit(monkeypatch):
+    """The retained 3 GiB pool replaces per-layer clears without lazy buildup."""
+    budget, previous = 3 * 1024**3, 8 * 1024**3
+    monkeypatch.setattr(v41_lang, "DS41_PREFILL_POOL", budget)
+    monkeypatch.setattr(v41_lang, "DS41_PREFILL_PIPELINE", True)
+    events = []
+    active_limit = [previous]
+
+    def set_limit(value):
+        old, active_limit[0] = active_limit[0], value
+        events.append(("limit", value))
+        return old
+
+    monkeypatch.setattr(v41_lang.mx, "set_cache_limit", set_limit)
+    monkeypatch.setattr(v41_lang.mx, "eval", lambda *args: events.append(("eval", args)))
+    monkeypatch.setattr(v41_lang.mx, "async_eval", lambda *args: events.append(("async", args)))
+    monkeypatch.setattr(v41_lang.mx, "clear_cache", lambda: events.append(("clear",)))
+    first, second = (object(), object()), (object(), object())
+    with v41_lang._LayerExecution(True) as execution:
+        assert active_limit[0] == budget
+        execution.submit(*first, 0)
+        execution.submit(*second, 1)
+        assert not any(event[0] == "clear" for event in events)
+
+    assert events == [("limit", budget), ("async", first), ("eval", first),
+                      ("async", second), ("eval", second),
+                      ("limit", previous), ("clear",)]
+    assert active_limit[0] == previous
 
 
 def test_apply_patch_replaces_foreign_vendor_alias_and_warns(caplog):

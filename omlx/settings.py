@@ -589,6 +589,9 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Preferred performance floor for bounded prefill plans. Zero preserves
+    # the legacy policy; prefill_min_chunk_tokens remains the emergency floor.
+    prefill_preferred_chunk_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -600,6 +603,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "prefill_preferred_chunk_tokens": self.prefill_preferred_chunk_tokens,
         }
 
     @classmethod
@@ -618,6 +622,7 @@ class MemorySettings:
             hard_threshold=float(data.get("hard_threshold", 0.95)),
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
+            prefill_preferred_chunk_tokens=int(data.get("prefill_preferred_chunk_tokens", 0)),
         )
 
 
@@ -1276,6 +1281,21 @@ class GlobalSettings:
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
 
+        # Registered runtimes can pin these over their legacy settings file.
+        # A malformed floor must fail startup, never silently fall back to a
+        # different admission policy. Numeric bounds are checked by validate().
+        for env_name, field_name in (
+            ("OMLX_PREFILL_MIN_CHUNK_TOKENS", "prefill_min_chunk_tokens"),
+            ("OMLX_PREFILL_PREFERRED_CHUNK_TOKENS", "prefill_preferred_chunk_tokens"),
+        ):
+            value = os.getenv(env_name)
+            if value is not None:
+                try:
+                    tokens = int(value)
+                except ValueError as exc:
+                    raise ValueError(f"{env_name} must be an integer, got {value!r}") from exc
+                setattr(self.memory, field_name, tokens)
+
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
             self.cache.enabled = cache_enabled.lower() in ("true", "1", "yes")
@@ -1786,6 +1806,16 @@ class GlobalSettings:
             errors.append(
                 f"prefill_min_chunk_tokens must be in [1, 1024], "
                 f"got {self.memory.prefill_min_chunk_tokens}"
+            )
+
+        preferred = self.memory.prefill_preferred_chunk_tokens
+        if type(preferred) is not int or not (
+            preferred == 0
+            or self.memory.prefill_min_chunk_tokens <= preferred <= 8192
+        ):
+            errors.append(
+                "prefill_preferred_chunk_tokens must be 0 (disabled) or in "
+                f"[prefill_min_chunk_tokens, 8192], got {preferred}"
             )
 
         # Scheduler validation

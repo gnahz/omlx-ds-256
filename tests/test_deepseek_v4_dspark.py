@@ -293,6 +293,58 @@ def test_dspark_generation_batch_samples_markov_chain(dsv4):
     assert state.hist_offset == 1
 
 
+def test_dspark_cost_policy_drafts_are_host_built_prefix(dsv4):
+    """Cost policy: one sync, drafts = a host-built prefix of the same chain."""
+    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _dspark_next_drafts,
+        _MtpState,
+    )
+
+    set_mtp_active(True)
+    set_mtp_depth(3)
+    try:
+        model = dsv4.Model(_tiny_config(dsv4))
+    finally:
+        set_mtp_active(False)
+
+    def greedy(logprobs):
+        return mx.argmax(logprobs, axis=-1)
+
+    greedy.temp = 0.0
+    batch = SimpleNamespace(
+        model=model,
+        samplers=[None],
+        fallback_sampler=greedy,
+        logits_processors=[[]],
+    )
+    seen = []
+
+    def choose(probabilities, context):
+        seen.append((list(probabilities), context))
+        return 2
+
+    results = []
+    for controller in (
+        None,
+        SimpleNamespace(cur=3, max_depth=3, cost_policy=True, choose_cost_depth=choose),
+    ):
+        state = _MtpState(depth=3, mtp_cache=model.make_mtp_cache())
+        state.controller = controller
+        state.hist_offset = 2048
+        _dspark_next_drafts(
+            batch, state, mx.zeros((1, 1, 24)), mx.array([4], dtype=mx.uint32), None
+        )
+        mx.eval(state.drafts)
+        results.append(state)
+
+    full, chosen = results
+    assert len(seen) == 1 and len(seen[0][0]) == 3 and seen[0][1] == 2049
+    assert chosen.drafts.dtype == mx.uint32
+    assert chosen.drafts.tolist() == full.drafts.tolist()[:2]
+    assert len(chosen.draft_lps) == len(chosen.draft_accept_lps) == 2
+
+
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
     [("affine", 8, 64), ("mxfp8", 8, 32)],

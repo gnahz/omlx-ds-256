@@ -67,6 +67,7 @@ def _custom_kernel_build_kwargs() -> dict:
                 "omlx_quant_matmul_kernels_nax",
                 sources=[
                     f"{quant}/affine_qmm_nax.metal",
+                    f"{quant}/deepseek_v41_joint_metadata.metal",
                     f"{quant}/oq_a8_nax.metal",
                     f"{quant}/oq_q8_a8_nax.metal",
                 ],
@@ -130,6 +131,7 @@ def _custom_kernel_build_kwargs() -> dict:
                     f"{quant}/command_queue.cpp",
                     f"{quant}/gather_qmm.cpp",
                     f"{quant}/grouped_expert.cpp",
+                    f"{quant}/deepseek_v41_joint_metadata.cpp",
                     f"{quant}/head_flat_qmm.cpp",
                     f"{quant}/moe_staging.cpp",
                     f"{quant}/moe_weighted_sum.cpp",

@@ -378,9 +378,11 @@ def _kernel():
 @lru_cache(maxsize=1)
 def nax_sparse_attention_available() -> bool:
     try:
-        from omlx.custom_kernels.nax import is_nax_available
+        from omlx.custom_kernels.nax import is_nax_hardware_available
 
-        return bool(is_nax_available())
+        # This module compiles its own MPP kernel. Stock MLX's precompiled
+        # kernel inventory does not determine whether that JIT is supported.
+        return bool(is_nax_hardware_available())
     except Exception:  # noqa: BLE001
         return False
 

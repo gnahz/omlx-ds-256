@@ -1,0 +1,3 @@
+
+# Patch context lines intentionally contain a leading space, even when empty.
+deploy/deepseek/patches/*.patch whitespace=-blank-at-eol

@@ -246,6 +246,8 @@ from .exceptions import (
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .prefill_progress import get_prefill_tracker
+from .request_preparation import get_request_preparation_tracker
+from .request_admission import get_request_admission
 from .server_metrics import get_server_metrics, reset_server_metrics
 from .utils import gpu_power
 from .utils.network import is_loopback_bind
@@ -508,6 +510,13 @@ async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     from .cluster.discovery import BonjourPublisher
 
+    # Keep startup cluster maintenance inside the explicitly selected runtime.
+    cluster_base = (
+        Path(_server_state.global_settings.base_path)
+        if _server_state.global_settings is not None
+        else Path.home() / ".omlx"
+    )
+
     bonjour_publisher = None
     bonjour_task = None
     # Startup: Auto-populate server aliases for the admin dashboard
@@ -548,7 +557,9 @@ async def lifespan(app: FastAPI):
     try:
         from .cluster.launch import reap_orphaned_launches
 
-        orphan_report = await asyncio.to_thread(reap_orphaned_launches)
+        orphan_report = await asyncio.to_thread(
+            reap_orphaned_launches, cluster_base / "cluster" / "runtime"
+        )
         if orphan_report["reaped"] or orphan_report["failures"]:
             logger.warning(
                 "Reaped orphaned distributed launches from a previous "
@@ -565,7 +576,7 @@ async def lifespan(app: FastAPI):
     try:
         from .cluster.worker_shim import ensure_cluster_python_shim
 
-        ensure_cluster_python_shim()
+        ensure_cluster_python_shim(home=cluster_base / "home")
     except (ImportError, OSError, RuntimeError) as exc:
         # RuntimeError: Path.home() cannot resolve a home directory.
         # Anything outside this set is a real bug and should surface loudly
@@ -657,6 +668,7 @@ async def lifespan(app: FastAPI):
             hard_threshold=memory_settings.hard_threshold,
             prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+            prefill_preferred_chunk_tokens=memory_settings.prefill_preferred_chunk_tokens,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -1116,6 +1128,15 @@ async def scheduler_queue_full_handler(
     )
 
 
+from .request_memory_budget import TransientMemoryPressureError
+
+
+@app.exception_handler(TransientMemoryPressureError)
+async def transient_memory_pressure_handler(request: FastAPIRequest, exc: TransientMemoryPressureError):
+    return JSONResponse(status_code=429, content=_openai_error_body(str(exc), 429),
+                        headers={"Retry-After": "1"})
+
+
 @app.exception_handler(DistributedInferenceError)
 async def distributed_unavailable_handler(
     request: FastAPIRequest, exc: DistributedInferenceError
@@ -1349,6 +1370,7 @@ class DebugRequestLoggingMiddleware:
 
 
 _DISCONNECT_SIGNAL_SCOPE_KEY = "omlx.client_disconnect_signal"
+_PREPARATION_SCOPE_KEY = "omlx.preparing_request_id"
 _disconnect_callback_tasks: set[asyncio.Task] = set()
 
 
@@ -1429,7 +1451,13 @@ class ClientDisconnectTrackingMiddleware:
                 signal.disconnect()
             return message
 
-        await self.app(scope, tracked_receive, send)
+        try:
+            await self.app(scope, tracked_receive, send)
+        finally:
+            request_id = scope.pop(_PREPARATION_SCOPE_KEY, None)
+            if request_id is not None:
+                get_request_preparation_tracker().close(request_id)
+                get_request_admission().release(request_id)
 
 
 # Keep this outside response middleware so every consumer of ASGI ``receive``
@@ -1681,6 +1709,7 @@ class _LLMEngineLease:
     model_id: str | None = None
     released: bool = False
     gpu_power_w: int | None = None
+    preparing_request_id: str | None = None
 
     def limit_gpu_power(self, watts: int | None) -> None:
         limiter = _server_state.gpu_power_limiter
@@ -1688,6 +1717,28 @@ class _LLMEngineLease:
             return
         self.gpu_power_w = watts
         limiter.acquire(watts)
+    async def begin_preparation(
+        self, http_request: FastAPIRequest, model_id: str | None
+    ) -> str:
+        request_id = str(uuid.uuid4())
+        if model_id is not None:
+            tracker = get_request_preparation_tracker()
+            if self.preparing_request_id is not None:
+                tracker.close(self.preparing_request_id)
+                get_request_admission().release(self.preparing_request_id)
+            self.preparing_request_id = request_id
+            scope = getattr(http_request, "scope", None)
+            if isinstance(scope, dict):
+                scope[_PREPARATION_SCOPE_KEY] = request_id
+            settings = getattr(_server_state.global_settings, "scheduler", None)
+            configured = getattr(settings, "max_concurrent_requests", 4)
+            limit = min(4, configured) if type(configured) is int and configured > 0 else 4
+            await get_request_admission().acquire(
+                request_id, model_id, limit=limit,
+                disconnected=getattr(http_request, "is_disconnected", None),
+            )
+            tracker.begin(request_id, model_id)
+        return request_id
 
     async def release(self) -> None:
         if self.released:
@@ -1695,11 +1746,18 @@ class _LLMEngineLease:
         self.released = True
         limiter = _server_state.gpu_power_limiter
         try:
-            if self.gpu_power_w is not None and limiter is not None:
-                limiter.release(self.gpu_power_w)
+            if self.preparing_request_id is not None:
+                try:
+                    get_request_preparation_tracker().close(self.preparing_request_id)
+                finally:
+                    get_request_admission().release(self.preparing_request_id)
         finally:
-            if self.model_id is not None:
-                await get_engine_pool().release_engine(self.model_id)
+            try:
+                if self.gpu_power_w is not None and limiter is not None:
+                    limiter.release(self.gpu_power_w)
+            finally:
+                if self.model_id is not None:
+                    await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
         return self.abort_reason() is not None
@@ -3257,6 +3315,9 @@ async def _with_json_keepalive(
                 yield " "
         try:
             result = task.result()
+        except TransientMemoryPressureError as e:
+            yield json.dumps(_openai_error_body(str(e), 429))
+            return
         except PrefillMemoryExceededError as e:
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
@@ -4599,6 +4660,7 @@ async def create_completion(
         model_load_duration = time.perf_counter() - load_start
         lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
         resolved_model = _serving_model_id(lease, request.model)
+        inference_request_id = await lease.begin_preparation(http_request, resolved_model)
 
         # Handle single prompt or list of prompts
         prompts = (
@@ -4612,6 +4674,11 @@ async def create_completion(
             prompt_token_ids_by_prompt.append(prompt_token_ids)
             validate_context_window(len(prompt_token_ids), request.model)
 
+        if prompt_token_ids_by_prompt:
+            get_request_preparation_tracker().set_prompt_tokens(
+                inference_request_id, len(prompt_token_ids_by_prompt[0])
+            )
+
         # Pre-flight prefill memory guard — see create_chat_completion for
         # the reason this must precede any StreamingResponse return.
         # Thread the client-provided X-Request-ID when present so the 400
@@ -4622,7 +4689,6 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = str(uuid.uuid4())
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4699,9 +4765,6 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
-            # A list prompt runs one engine request per prompt, so no single id.
-            if len(prompts) == 1:
-                gen_kwargs["_request_id"] = inference_request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -4718,6 +4781,14 @@ async def create_completion(
             # prior generation time as prefill.
             first_token_at = None
             for i, prompt in enumerate(prompts):
+                prompt_request_id = inference_request_id
+                if i:
+                    prompt_request_id = await lease.begin_preparation(
+                        http_request, resolved_model
+                    )
+                    get_request_preparation_tracker().set_prompt_tokens(
+                        prompt_request_id, len(prompt_token_ids_by_prompt[i])
+                    )
                 output = await engine.generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -4732,6 +4803,7 @@ async def create_completion(
                     xtc_threshold=xtc_threshold,
                     stop=request.stop,
                     seed=request.seed,
+                    _request_id=prompt_request_id,
                     **gen_kwargs,
                 )
                 if i == 0:
@@ -5038,8 +5110,6 @@ async def create_chat_completion(
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
 
-    request = await _preprocess_markitdown_files_for_llm(request)
-
     # Block inference during quantization to prevent GPU Metal errors
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -5056,6 +5126,8 @@ async def create_chat_completion(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        inference_request_id = await lease.begin_preparation(http_request, resolved_model)
+        request = await _preprocess_markitdown_files_for_llm(request)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5159,6 +5231,9 @@ async def create_chat_completion(
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
         validate_context_window(num_prompt_tokens, request.model)
+        get_request_preparation_tracker().set_prompt_tokens(
+            inference_request_id, num_prompt_tokens
+        )
 
         # Prepare kwargs
         (
@@ -5282,7 +5357,6 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = str(uuid.uuid4())
         chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
@@ -8012,6 +8086,7 @@ async def create_anthropic_message(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        inference_request_id = await lease.begin_preparation(http_request, resolved_model)
 
         prompt = await _prepare_anthropic_prompt(request, engine, resolved_model)
         messages = prompt.messages
@@ -8089,6 +8164,9 @@ async def create_anthropic_message(
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
         validate_context_window(num_prompt_tokens, request.model)
+        get_request_preparation_tracker().set_prompt_tokens(
+            inference_request_id, num_prompt_tokens
+        )
 
         if prepared_prompt is not None:
             chat_kwargs["_prepared_prompt"] = prepared_prompt
@@ -8108,7 +8186,6 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = str(uuid.uuid4())
         chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
@@ -8566,6 +8643,7 @@ async def create_response(
         lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
 
         resolved_model = _serving_model_id(lease, request.model)
+        inference_request_id = await lease.begin_preparation(http_request, resolved_model)
 
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
@@ -8758,6 +8836,9 @@ async def create_response(
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
         validate_context_window(num_prompt_tokens, request.model)
+        get_request_preparation_tracker().set_prompt_tokens(
+            inference_request_id, num_prompt_tokens
+        )
 
         # Build sampling kwargs
         (
@@ -8850,7 +8931,6 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
-        inference_request_id = str(uuid.uuid4())
         chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:

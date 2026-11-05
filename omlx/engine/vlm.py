@@ -57,6 +57,7 @@ from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..request_preparation import get_request_preparation_tracker
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_image_hash,
@@ -1379,6 +1380,112 @@ def _grid_row(image_grid_thw: Any, i: int) -> Optional[List[int]]:
     except (IndexError, TypeError, ValueError):
         return None
     return row if len(row) == 3 else None
+
+
+def _deepseek_v41_image_cache_key_ranges(
+    token_ids: list[int],
+    inputs: dict[str, Any],
+    images: list[Any],
+    config: Any,
+) -> list[tuple[int, str]]:
+    """Key each final image span by all image inputs preceding its end.
+
+    V4.1 uses the same placeholder ID for every image position. Token IDs
+    alone cannot distinguish pixels or even equal-length grids with different
+    layouts. The processor's final spans are authoritative: rendering shorter
+    message prefixes can move the boundary when thinking/tool turns change.
+    Keep each cumulative identity independent of images appended after it.
+    """
+    def metadata(name):
+        value = inputs.get(name)
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)) or len(value) != len(images):
+            raise ValueError(f"DeepSeek V4.1 {name} does not match the images")
+        return value
+
+    spans = metadata("image_spans")
+    grids = metadata("image_grids")
+    layouts = metadata("image_types")
+    image_token_id = config.image_token_id
+    ratio = config.vision_downsample_ratio
+    if type(image_token_id) is not int or type(ratio) is not int or ratio <= 0:
+        raise ValueError("Invalid DeepSeek V4.1 image configuration")
+
+    # Version the fixed RGB/padding/normalization/BF16 preprocessing contract.
+    # The service's runtime fingerprint also isolates model/source revisions.
+    preprocessing = {
+        "version": "deepseek-v41-image-prefix-v1",
+        "prefill": "inputs-embeds-image-mask-v1",
+        "pixels": "decoded-rgb-pad-normalize-bf16",
+        **{
+            name: getattr(config, name)
+            for name in (
+                "image_token_id",
+                "vision_patch_size",
+                "vision_downsample_ratio",
+                "vision_min_pixels",
+                "vision_max_n_token",
+                "vision_max_wh_ratio",
+            )
+        },
+    }
+    cumulative = hashlib.sha256(
+        json.dumps(
+            preprocessing, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    )
+    pixel_hashes = compute_per_image_hashes(images)
+    # Until cross-path numerical parity is established, even image-free
+    # leading text uses the VLM domain rather than text-only cache entries.
+    # This fixed domain does not depend on how many later images are present.
+    ranges = [(0, cumulative.hexdigest())]
+    previous_end = 0
+    total_image_tokens = 0
+    for span, grid, layout, pixel_hash in zip(spans, grids, layouts, pixel_hashes):
+        if hasattr(layout, "tolist"):
+            layout = layout.tolist()
+        if (
+            not isinstance(span, (list, tuple))
+            or len(span) != 2
+            or not all(type(value) is int for value in span)
+            or not isinstance(grid, (list, tuple))
+            or len(grid) != 2
+            or not all(type(value) is int and value > 0 for value in grid)
+        ):
+            raise ValueError("Invalid DeepSeek V4.1 image span or grid")
+        start, length = span
+        end = start + length
+        height, width = ((value + ratio - 1) // ratio for value in grid)
+        expected_layout = [0] + ([1] * width + [2]) * height + [3]
+        if (
+            start < previous_end
+            or length != len(expected_layout)
+            or end > len(token_ids)
+            or not isinstance(layout, (list, tuple))
+            or list(layout) != expected_layout
+            or any(token != image_token_id for token in token_ids[start:end])
+        ):
+            raise ValueError("DeepSeek V4.1 image layout does not match final tokens")
+        # No absolute start or future-image data belongs in this identity:
+        # the prefix tokens already encode placement and intervening text.
+        identity = {
+            "pixels": pixel_hash,
+            "grid": list(grid),
+            "types": list(layout),
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        cumulative.update(len(encoded).to_bytes(8, "big"))
+        cumulative.update(encoded)
+        if ranges[-1][0] == start:
+            ranges[-1] = (start, cumulative.hexdigest())
+        else:
+            ranges.append((start, cumulative.hexdigest()))
+        previous_end = end
+        total_image_tokens += length
+    if token_ids.count(image_token_id) != total_image_tokens:
+        raise ValueError("DeepSeek V4.1 image spans leave unkeyed image tokens")
+    return ranges
 
 
 def _grid_image_token_starts(
@@ -4268,7 +4375,16 @@ class VLMBatchedEngine(BaseEngine):
         token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
         image_cache_key_start = 0
         image_cache_key_ranges: list[Tuple[int, str]] = []
-        if image_message_ranges:
+        if model_type == "deepseek_v41" and num_images:
+            # A single processor pass supplies exact boundaries, including
+            # multiple/nested images in one message and interleaved text.
+            # Invalid metadata must fail closed rather than expose image KV
+            # under a token-only or geometry-blind fallback key.
+            image_cache_key_ranges = _deepseek_v41_image_cache_key_ranges(
+                token_ids, inputs, images, self._vlm_model.config
+            )
+            image_cache_key_start = image_cache_key_ranges[0][0]
+        elif image_message_ranges:
             try:
                 image_starts = None
                 if (
@@ -4403,7 +4519,11 @@ class VLMBatchedEngine(BaseEngine):
             image_hash = None
             image_token_count = None
             if num_images > 0:
-                image_hash = compute_image_hash(images)
+                image_hash = (
+                    image_cache_key_ranges[-1][1]
+                    if model_type == "deepseek_v41"
+                    else compute_image_hash(images)
+                )
                 image_token_count = self._image_token_count(input_ids)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
@@ -4425,6 +4545,7 @@ class VLMBatchedEngine(BaseEngine):
 
             if (
                 num_images > 0
+                and model_type != "deepseek_v41"
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
                 # Fast path already assembled the combined features.
@@ -4786,6 +4907,13 @@ class VLMBatchedEngine(BaseEngine):
             except Exception as e:
                 logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+    def _clean_generation_text(self, text: str) -> str:
+        # DeepSeek continuations can end in whitespace tokens. Preserve those
+        # bytes so complete responses match concatenated streaming deltas.
+        if self.model_type == "deepseek_v41":
+            return remove_special_tokens_preserve_whitespace(text)
+        return clean_special_tokens(text)
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -4891,7 +5019,7 @@ class VLMBatchedEngine(BaseEngine):
             **specprefill_kwargs,
         )
 
-        text = clean_special_tokens(output.output_text)
+        text = self._clean_generation_text(output.output_text)
 
         return GenerationOutput(
             text=text,
@@ -5022,7 +5150,7 @@ class VLMBatchedEngine(BaseEngine):
         finished_normally = False
         try:
             async for output in engine.stream_outputs(request_id):
-                text = clean_special_tokens(output.output_text)
+                text = self._clean_generation_text(output.output_text)
 
                 if output.finished:
                     finished_normally = True
@@ -5108,7 +5236,6 @@ class VLMBatchedEngine(BaseEngine):
                 cached_tokens=0,
             )
 
-        loop = asyncio.get_running_loop()
         # _process_chat_messages pops these; the tail marker needs them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
@@ -5119,7 +5246,8 @@ class VLMBatchedEngine(BaseEngine):
             image_hash,
             image_cache_key_start,
             image_cache_key_ranges,
-        ) = await loop.run_in_executor(
+        ) = await get_request_preparation_tracker().prepare_prompt(
+            kwargs.get("_request_id"),
             self._engine._mlx_executor,
             self._process_chat_messages,
             messages,
@@ -5362,7 +5490,6 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
-        loop = asyncio.get_running_loop()
         # _process_chat_messages pops these; the tail marker needs them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
@@ -5373,7 +5500,8 @@ class VLMBatchedEngine(BaseEngine):
             image_hash,
             image_cache_key_start,
             image_cache_key_ranges,
-        ) = await loop.run_in_executor(
+        ) = await get_request_preparation_tracker().prepare_prompt(
+            kwargs.get("_request_id"),
             self._engine._mlx_executor,
             self._process_chat_messages,
             messages,
@@ -5493,6 +5621,11 @@ class VLMBatchedEngine(BaseEngine):
         """
         media_messages = messages
         model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type == "deepseek_v41":
+            from ..patches.deepseek_v41.processing import prepare_media_messages
+
+            media_messages, text_messages, images, audio = prepare_media_messages(messages)
+            return media_messages, text_messages, images, audio, []
         if model_type in {"mimo_v2", "mimo_v2_flash"}:
             media_messages = expand_video_parts(messages)
         if not getattr(self, "_native_video", False):

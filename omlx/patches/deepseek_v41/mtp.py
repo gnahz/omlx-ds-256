@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """DSpark integration with oMLX's shared speculative acceptance loop."""
 
+import os
+
 import mlx.core as mx
 
 from . import growth
@@ -17,6 +19,10 @@ class AcceptanceDepthController:
 
     def __init__(self, depth):
         self.max_depth = max(1, int(depth))
+        self.cost_policy = (
+            os.environ.get("DS41_MTP_COST_POLICY", "0") == "1"
+            and self.max_depth <= 4
+        )
         self.cur = self.max_depth
         self._warmup = False
         self.exit_streak = 0
@@ -26,6 +32,33 @@ class AcceptanceDepthController:
         accepted = max(0, min(int(accepted), int(used)))
         self.cur = min(self.max_depth, accepted + 1)
 
+    def choose_cost_depth(self, probabilities, context):
+        """Maximize predicted committed tokens per profiled verify cycle.
+
+        Costs are offline measurements, not runtime timing. Below 1024 tokens
+        the front-padded index layout depends on verify width, so preserve the
+        served acceptance-only rule. Always retain a draft (verify L >= 2).
+        """
+        if not self.cost_policy or context < 1024:
+            return self.cur
+        # Warm verify C(L), L=2..5, plus 5 ms drafter/loop allowance.
+        # Fixed profiles keep decisions independent of machine load and batch
+        # scheduling. C2 has the same rising marginal-cost shape.
+        if context >= 524288:
+            costs = (33.39, 38.61, 41.48, 45.72)
+        elif context >= 131072:
+            costs = (32.03, 36.64, 39.65, 43.28)
+        else:
+            costs = (31.72, 36.06, 38.84, 42.28)
+        cumulative, expected, best, best_utility = 1.0, 1.0, 1, -1.0
+        for index, probability in enumerate(probabilities[: self.max_depth]):
+            cumulative *= max(0.0, min(1.0, float(probability)))
+            expected += cumulative
+            utility = expected / costs[index]
+            if utility > best_utility:
+                best, best_utility = index + 1, utility
+        return best
+
     def should_exit(self):
         # Timing-based handoff would also change the subsequent numeric path.
         return False
@@ -33,6 +66,11 @@ class AcceptanceDepthController:
 
 class DSparkMixin:
     _omlx_mtp_multi_request = True
+    _omlx_dspark_cache_owned = True
+    _omlx_mtp_preserve_requests = True
+    # dspark_forward / dspark_forward_batch take cost_policy (DS41_DRAFT_HEAD picks the head from it);
+    # the shared batch generator passes it only to hosts that set this.
+    _omlx_dspark_cost_head = True
 
     def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
@@ -84,12 +122,26 @@ class DSparkMixin:
         for stage, item in zip(self.mtp, cache):
             stage.attn.append_context(projected, item, start_offset=start_offset)
 
-    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None):
+    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None, cost_policy=False):
         from .dspark import proposal_forward
 
         cache = self.make_mtp_cache() if cache is None else cache
         self.dspark_append_context(main_hidden, cache)
-        return proposal_forward(self, anchor_ids, cache, draft_length)
+        return proposal_forward(self, anchor_ids, cache, draft_length, cost_policy=cost_policy)
+
+    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths, cost_policy=None):
+        """dspark_forward for several requests in one decoder pass (dspark.proposal_forward_batch).
+
+        Returns each request's draft logits, or None (nothing done) when the blocks cannot share a pass.
+        cost_policy: per request, as dspark_forward's.
+        """
+        from .dspark import batch_supported, proposal_forward_batch
+
+        if not batch_supported(self, list(widths)):
+            return None
+        for hidden, cache in zip(main_hiddens, caches):
+            self.dspark_append_context(hidden, cache)
+        return proposal_forward_batch(self, anchors, caches, widths[0], cost_policy)
 
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)
@@ -106,6 +158,56 @@ class DSparkMixin:
         from ..mlx_lm_mtp.deepseek_v4_dspark import take_primed
 
         return take_primed(self, cache, main_token)
+
+    def mtp_extract_request_caches(self, cache):
+        import numpy as np
+
+        offsets = np.asarray(mx.stack([item.offset for item in cache]))
+        if np.any(offsets != offsets[0]):
+            raise ValueError("DSpark cache offsets diverged across layers")
+        return [
+            [item.extract(row, offset=int(start)) for item in cache]
+            for row, start in enumerate(offsets[0])
+        ]
+
+    def mtp_verify_requests(self, inputs, caches):
+        from .batched_verify import forward
+
+        # Distributed stages retain their upstream collective transfer order.
+        if getattr(self, "pipeline_size", 1) > 1 or any(
+            getattr(layer, "_tensor_group", None) is not None
+            for layer in self.pipeline_layers
+        ):
+            if not inputs or len(inputs) != len(caches):
+                raise ValueError("One cache is required per verification request")
+            return [(lambda result: (result[0], result[1], None))(
+                self(ids, cache=cache, return_hidden=True, target_verify=True))
+                for ids, cache in zip(inputs, caches)]
+        if not inputs or len(inputs) != len(caches):
+            raise ValueError("One cache is required per verification request")
+        if any(ids.ndim != 2 or ids.shape[0] != 1 or not 1 <= ids.shape[1] <= 8
+               for ids in inputs):
+            raise ValueError("Ragged verification supports one to eight unpadded rows per request")
+        # Eight requests with the production four-token CopyIndex draft can
+        # supply40 verify rows. Preserve all drafts and request order while
+        # keeping each shared native workspace at the qualified32-row bound.
+        results, group_inputs, group_caches, rows = [], [], [], 0
+        for ids, cache in zip(inputs, caches):
+            length = ids.shape[1]
+            if group_inputs and rows + length > 32:
+                results.extend(forward(self, group_inputs, group_caches))
+                group_inputs, group_caches, rows = [], [], 0
+            group_inputs.append(ids)
+            group_caches.append(cache)
+            rows += length
+        results.extend(forward(self, group_inputs, group_caches))
+        return results
+
+    def mtp_verify_requests_exact(self, inputs, caches):
+        """Optional singleton-arithmetic diagnostic; default dispatch is unchanged."""
+        from .exact_verify import forward
+
+        return forward(self, inputs, caches)
 
     def mtp_partial_rollback(self, cache, accepted, num_drafts):
         if not 0 <= accepted <= num_drafts:

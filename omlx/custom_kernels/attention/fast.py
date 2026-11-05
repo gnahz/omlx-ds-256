@@ -28,6 +28,58 @@ def has_symbol(name: str) -> bool:
 NATIVE_AVAILABLE = _ext is not None
 
 
+def deepseek_v41_packed_attention_route(
+    *, query_tokens, batch_size, num_heads, head_dim, is_gpu, is_bfloat16,
+    local_rows, pooled_rows, local_row_bytes=528, pooled_row_bytes=288,
+    selected_rows=0, native_decode=True, native_verify=False,
+):
+    """One metadata-only route predicate shared by dispatch and admission."""
+    geometry = (query_tokens, batch_size, num_heads, head_dim, local_rows, pooled_rows)
+    if (any(type(value) is not int for value in geometry)
+            or query_tokens <= 0 or batch_size <= 0
+            or num_heads != 64 or head_dim != 512 or local_rows < query_tokens
+            or pooled_rows < 0 or local_row_bytes != 528 or pooled_row_bytes != 288
+            or is_gpu is not True or is_bfloat16 is not True):
+        return None
+    if (native_decode and query_tokens == 1 and selected_rows == 0
+            and pooled_rows == 0 and has_symbol("packed_sparse_attention_single_decode")):
+        return "single"
+    if ((query_tokens > 8 or (native_verify and query_tokens > 1))
+            and has_symbol("packed_sparse_attention")):
+        return "multi"
+    return None
+
+
+def deepseek_v41_prefill_workspace_descriptor(
+    *, batch_size, num_heads, head_dim, is_gpu, is_bfloat16,
+):
+    """Absent/stale native extensions retain conservative fallback pricing."""
+    if (batch_size != 1 or getattr(_ext, "PACKED_SPARSE_WORKSPACE_ABI", None) != 1
+            or not has_symbol("packed_sparse_attention_workspace")
+            or deepseek_v41_packed_attention_route(
+                query_tokens=256, batch_size=batch_size, num_heads=num_heads,
+                head_dim=head_dim, is_gpu=is_gpu, is_bfloat16=is_bfloat16,
+                local_rows=256, pooled_rows=0) != "multi"):
+        return None
+
+    def workspace(query_tokens, local_rows, pooled_rows):
+        if deepseek_v41_packed_attention_route(
+                query_tokens=query_tokens, batch_size=1, num_heads=num_heads,
+                head_dim=head_dim, is_gpu=is_gpu, is_bfloat16=is_bfloat16,
+                local_rows=local_rows, pooled_rows=pooled_rows) != "multi":
+            return None
+        result = _ext.packed_sparse_attention_workspace(
+            1, query_tokens, local_rows, pooled_rows)
+        if (not isinstance(result, dict) or result.get("abi") != 1
+                or type(result.get("scratch_bytes")) is not int
+                or not 0 <= result["scratch_bytes"] <= 80 * 1024**2):
+            return None
+        return result
+
+    return {"abi": 1, "workspace": workspace, "batch_size": 1,
+            "num_heads": num_heads, "head_dim": head_dim}
+
+
 def sparse_mla_attention(
     q_latent: mx.array,
     q_pe: mx.array,
@@ -142,6 +194,35 @@ def packed_sparse_attention(
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("packed_sparse_attention native kernel is unavailable")
+
+def packed_sparse_attention_single_decode(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk_indices: mx.array,
+    sinks: mx.array,
+    scale: float,
+    q_offset: int,
+    compress_ratio: int,
+    local_window: int,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "packed_sparse_attention_single_decode"):
+        return _ext.packed_sparse_attention_single_decode(
+            q,
+            local_kv,
+            pooled,
+            topk_indices,
+            sinks,
+            scale,
+            q_offset,
+            compress_ratio,
+            local_window,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("packed_sparse_attention_single_decode native kernel is unavailable")
+
 
 
 def sparse_gqa_attention(

@@ -16,6 +16,19 @@ if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
 
 
+_DECODE_RATE_WINDOW_SECONDS = 3.0
+_DECODE_RATE_WARMUP_SECONDS = 1.0
+_DECODE_RATE_BUCKETS_PER_SECOND = 10
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodeRateState:
+    started_at: float
+    last_token_at: float | None = None
+    # One sample per 100 ms, holding the recorded output count in that bucket.
+    samples: tuple[tuple[int, int], ...] = ()
+
+
 class RequestStatus(enum.IntEnum):
     """Status of a request in the scheduling system."""
 
@@ -145,6 +158,9 @@ class Request:
     generation_started_at: Optional[float] = None
     prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
+    _decode_rate: _DecodeRateState | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
@@ -153,6 +169,9 @@ class Request:
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
     prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
+    # Frozen before a request-local prefill resume advances cached_tokens.
+    # None retains legacy accounting for paths without local resumes.
+    cache_reused_tokens: Optional[int] = None
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
 
     # Paged cache fields (for BlockAwarePrefixCache)
@@ -204,16 +223,16 @@ class Request:
     vlm_extra_kwargs: Optional[Dict[str, Any]] = (
         None  # Model-specific kwargs (e.g., position_ids)
     )
-    vlm_image_hash: Optional[str] = None  # SHA256 hash of images for prefix cache
+    vlm_image_hash: Optional[str] = None  # Final cumulative media/preprocessing identity
     vlm_cache_key_start: int = 0  # Token index where image-specific cache keying starts
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = (
-        None  # [(token_start, cumulative_image_hash)]
+        None  # [(token_start, cumulative_media_identity)]; may start with a VLM domain
     )
     rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
     @property
     def vlm_extra_keys_for_cache(self) -> Optional[Tuple[str, ...]]:
-        """Whole-request image hash wrapped as extra_keys tuple."""
+        """Final media identity wrapped as the whole-request fallback key."""
         if self.vlm_image_hash:
             return (self.vlm_image_hash,)
         return None
@@ -229,7 +248,7 @@ class Request:
     def vlm_extra_key_ranges_for_cache(
         self,
     ) -> Optional[List[Tuple[int, Tuple[str, ...]]]]:
-        """Segmented VLM cache key ranges for per-image-turn keying."""
+        """Segmented VLM domains and cumulative per-image cache identities."""
         if not self.vlm_cache_key_ranges:
             return None
         return [
@@ -279,9 +298,63 @@ class Request:
     tools: list[dict[str, Any]] | None = None
 
     @property
+    def api_cached_tokens(self) -> int:
+        """Only tokens reused from another request, never local retry progress."""
+        count = (
+            self.cached_tokens - self.prefill_resumed_tokens
+            if self.cache_reused_tokens is None
+            else self.cache_reused_tokens
+        )
+        return max(0, min(int(count), self.num_prompt_tokens))
+
+    @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
         return len(self.output_token_ids)
+
+    def reset_decode_rate(self, started_at: float | None = None) -> None:
+        """Discard samples at requeue and start a new window at decode admission."""
+        self._decode_rate = (
+            _DecodeRateState(started_at) if started_at is not None else None
+        )
+
+    def record_decode_tokens(self, now: float, count: int) -> None:
+        """Record one scheduler batch of accepted output tokens."""
+        state = self._decode_rate
+        if state is None:
+            return
+        bucket = int(now * _DECODE_RATE_BUCKETS_PER_SECOND)
+        oldest = bucket - int(
+            _DECODE_RATE_WINDOW_SECONDS * _DECODE_RATE_BUCKETS_PER_SECOND
+        )
+        samples = state.samples
+        if samples and samples[0][0] < oldest:
+            samples = tuple(sample for sample in samples if sample[0] >= oldest)
+        if samples and samples[-1][0] == bucket:
+            count += samples[-1][1]
+            samples = samples[:-1]
+        # The admin thread may read the state while decode continues.
+        self._decode_rate = _DecodeRateState(
+            state.started_at, now, (*samples, (bucket, count))
+        )
+
+    def recent_decode_tokens_per_second(self, now: float) -> float | None:
+        """Output rate over up to three wall-clock seconds, after a short warmup."""
+        state = self._decode_rate
+        if state is None:
+            return None
+        elapsed = now - state.started_at
+        if elapsed < _DECODE_RATE_WARMUP_SECONDS:
+            return None
+        if (
+            state.last_token_at is None
+            or now - state.last_token_at >= _DECODE_RATE_WINDOW_SECONDS
+        ):
+            return 0.0
+        span = min(elapsed, _DECODE_RATE_WINDOW_SECONDS)
+        oldest = int((now - span) * _DECODE_RATE_BUCKETS_PER_SECOND)
+        tokens = sum(count for bucket, count in state.samples if bucket >= oldest)
+        return tokens / span
 
     @property
     def num_tokens(self) -> int:

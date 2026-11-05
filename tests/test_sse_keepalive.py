@@ -699,7 +699,13 @@ def responses_route(monkeypatch):
     for name in ("settings_manager", "mcp_manager", "oq_manager"):
         monkeypatch.setattr(server._server_state, name, None)
     release = AsyncMock()
-    monkeypatch.setattr(server._LLMEngineLease, "release", release)
+    actual_release = server._LLMEngineLease.release
+
+    async def release_with_cleanup(lease):
+        await release()
+        await actual_release(lease)
+
+    monkeypatch.setattr(server._LLMEngineLease, "release", release_with_cleanup)
 
     # Exercise the route's actual wrapper selection with short test intervals.
     wrap = server._with_sse_keepalive

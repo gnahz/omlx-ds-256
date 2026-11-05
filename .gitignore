@@ -59,6 +59,12 @@ cover/
 # Environments
 .env
 .venv
+.venv-dev/
+.venv-*/
+# DeepSeek runtime state and downloaded weights belong outside the checkout.
+/models/
+/runtime-state/
+/deploy/deepseek/.state/
 env/
 venv/
 ENV/

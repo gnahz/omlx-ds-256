@@ -47,6 +47,7 @@ from .exceptions import (
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
+from .request_preparation import get_request_preparation_tracker
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import (
     FATAL_TEARDOWN_TIMEOUT_S,
@@ -191,6 +192,9 @@ def _raise_request_output_error(output: RequestOutput) -> None:
         )
     if output.error_code == "model_unloading":
         raise RequestAbortedError(output.error, request_id=output.request_id)
+    if output.error_code in {"decode_memory_budget_exceeded", "memory_admission_stalled", "prefill_memory_budget_exceeded"}:
+        from .request_memory_budget import TransientMemoryPressureError
+        raise TransientMemoryPressureError(output.error)
     raise RuntimeError(output.error)
 
 
@@ -335,8 +339,8 @@ class EngineConfig:
     # case) there is no concurrent request to stay responsive to, so we burst
     # aggressively (decode_burst_budget_single_s). Once concurrent, we use the
     # tight decode_burst_budget_s to keep admission/abort latency low.
-    # A request's first generated chunk always ends the burst so buffering
-    # later decode steps does not add to its time to first token.
+    # A request's first and terminal chunks always end the burst, keeping
+    # later decode or prefill steps out of first-token and completion delivery.
     # max_steps is a safety cap (bounds the host-side output list), NOT a
     # memory knob. Set both budgets <= 0, or max_steps <= 1, to disable.
     decode_burst_max_steps: int = field(
@@ -385,6 +389,9 @@ class EngineCore:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or EngineConfig()
+        # Read live by _step_burst. Isolated controls can disable this while
+        # idle to compare the original completion hand-off in the same process.
+        self._terminal_response_barrier_enabled = True
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
@@ -511,8 +518,8 @@ class EngineCore:
         scheduler.step() services aborts/admission/finish every step, so
         correctness is unchanged; the only cost is event-loop responsiveness,
         bounded by decode_burst_budget_s. Stops early when no work remains, a
-        request produces its first chunk, a prefill eviction needs the (async)
-        callback, or the budget elapses —
+        request produces its first or terminal chunk, a prefill eviction needs
+        the (async) callback, or the budget elapses —
         the budget also ends the burst when a slow prefill-chunk step lands.
 
         Runs on the MLX executor thread. Returns the SchedulerOutputs in order.
@@ -535,6 +542,15 @@ class EngineCore:
         deadline = time.monotonic() + budget
         while len(outputs) < max_steps:
             last = outputs[-1]
+            # Deliver completions before another scheduler step can start an
+            # uncontented synchronous prefill. A burst's outputs do not reach
+            # HTTP collectors until this executor hand-off returns; the last
+            # decode disappearing must not strand its final packet behind a
+            # queued long prompt. Empty-token and error completions count too.
+            if getattr(self, "_terminal_response_barrier_enabled", True) and (
+                last.finished_request_ids or any(item.finished for item in last.outputs)
+            ):
+                break
             # Also release the first chunk of a request admitted mid-burst.
             # Comparing cumulative and new tokens covers multi-token steps
             # without per-request tracking. Later chunks retain normal bursts.
@@ -821,10 +837,10 @@ class EngineCore:
         # accumulates one collector + one stream_state + one
         # asyncio.Event per refused request. Re-raise after cleanup so
         # the typed exception still reaches the FastAPI 400 handler.
-        loop = asyncio.get_running_loop()
+        tracker = get_request_preparation_tracker()
         try:
-            await loop.run_in_executor(
-                self._mlx_executor, self.scheduler.add_request, request
+            await tracker.submit_to_scheduler(
+                request_id, self._mlx_executor, self.scheduler.add_request, request
             )
         except BaseException:
             # If the caller is cancelled here (e.g. the client disconnected
@@ -843,7 +859,9 @@ class EngineCore:
                     f"Abort of partial insert for {request_id} failed: {abort_exc}"
                 )
             self._cleanup_request(request_id)
+            tracker.close(request_id)
             raise
+        tracker.close(request_id)
         self._wake_engine_loop()
 
         return request_id

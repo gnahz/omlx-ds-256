@@ -12,11 +12,12 @@ using namespace mlx::core;
 class GroupedExpert : public Primitive {
  public:
   GroupedExpert(Stream s, const array& gate, const array& up,
-                const array& activation, const array& down)
+                const array& activation, const array& down, bool paired)
       : Primitive(s), operations_{gate.primitive_ptr(), up.primitive_ptr(),
                                  activation.primitive_ptr(), down.primitive_ptr()},
         intermediate_shape_(gate.shape()),
-        gate_inputs_(gate.inputs().size()), up_inputs_(up.inputs().size()) {}
+        gate_inputs_(gate.inputs().size()),
+        up_inputs_(paired ? 0 : up.inputs().size()), paired_(paired) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("DeepSeek V4.1 grouped expert requires GPU execution");
@@ -32,15 +33,36 @@ class GroupedExpert : public Primitive {
     const auto up_begin = gate_inputs_;
     const auto activation_begin = gate_inputs_ + up_inputs_;
     const auto down_begin = activation_begin + 2;
-    operations_[0]->eval_gpu(
-        std::vector<array>(in.begin(), in.begin() + up_begin), gate);
-    encoder.add_temporary(gate[0]);
-    operations_[1]->eval_gpu(
-        std::vector<array>(in.begin() + up_begin, in.begin() + activation_begin), up);
-    encoder.add_temporary(up[0]);
+    if (paired_) {
+      // The encoder uses command buffers with unretained references. Register
+      // all three array descriptors before any paired GPU operation can run;
+      // CustomKernel::eval_gpu fills these same descriptors with set_data.
+      // A null Buffer is a valid, allocation-free placeholder (the allocator
+      // accepts free(nullptr)). If preparation or registration throws, no new
+      // GPU work has started, and encoder cleanup may safely inspect ptr().
+      for (auto* temporary : {&gate[0], &up[0], &activation[0]}) {
+        temporary->set_data(allocator::Data(allocator::Buffer(nullptr), nullptr));
+        encoder.add_temporary(*temporary);
+      }
+      // A CustomKernel with two sibling outputs must be evaluated once with
+      // both outputs. Evaluating each sibling separately would dispatch twice
+      // and would give its implementation the wrong output vector.
+      std::vector<array> pair{gate[0], up[0]};
+      operations_[0]->eval_gpu(
+          std::vector<array>(in.begin(), in.begin() + up_begin), pair);
+    } else {
+      operations_[0]->eval_gpu(
+          std::vector<array>(in.begin(), in.begin() + up_begin), gate);
+      encoder.add_temporary(gate[0]);
+      operations_[1]->eval_gpu(
+          std::vector<array>(in.begin() + up_begin, in.begin() + activation_begin), up);
+      encoder.add_temporary(up[0]);
+    }
     operations_[2]->eval_gpu(
         {gate[0], up[0], in[activation_begin], in[activation_begin + 1]}, activation);
-    encoder.add_temporary(activation[0]);
+    if (!paired_) {
+      encoder.add_temporary(activation[0]);
+    }
     std::vector<array> down_inputs{activation[0]};
     down_inputs.insert(down_inputs.end(), in.begin() + down_begin, in.end());
     operations_[3]->eval_gpu(down_inputs, out);
@@ -55,6 +77,7 @@ class GroupedExpert : public Primitive {
   Shape intermediate_shape_;
   size_t gate_inputs_;
   size_t up_inputs_;
+  bool paired_;
 };
 } // namespace
 
@@ -62,7 +85,29 @@ mlx::core::array grouped_expert(
     const mlx::core::array& gate, const mlx::core::array& up,
     const mlx::core::array& activation, const mlx::core::array& down) {
   using namespace mlx::core;
+  const bool paired = gate.has_primitive() && up.has_primitive() &&
+      std::string(gate.primitive().name()) == "CustomKernel" &&
+      std::string(up.primitive().name()) == "CustomKernel";
+  if (paired) {
+    if (gate.primitive_ptr() != up.primitive_ptr() || gate.id() == up.id() ||
+        gate.sibling_position() != 0 || up.sibling_position() != 1 ||
+        gate.siblings().size() != 1 || up.siblings().size() != 1 ||
+        gate.siblings()[0].id() != up.id() || up.siblings()[0].id() != gate.id() ||
+        gate.inputs().empty() || gate.inputs().size() != up.inputs().size() ||
+        gate.dtype() != bfloat16 || up.dtype() != bfloat16) {
+      throw std::invalid_argument("Expected ordered BF16 gate/up CustomKernel siblings");
+    }
+    for (size_t i = 0; i < gate.inputs().size(); ++i) {
+      if (gate.inputs()[i].id() != up.inputs()[i].id()) {
+        throw std::invalid_argument("Gate/up siblings must share identical inputs");
+      }
+    }
+  }
+  // Preserve the existing GatherQMM contract for ordinary gate/up nodes.
   for (const auto* node : {&gate, &up, &down}) {
+    if (paired && node != &down) {
+      continue;
+    }
     if (!node->has_primitive() ||
         std::string(node->primitive().name()) != "GatherQMM" ||
         (node->inputs().size() != 5 && node->inputs().size() != 6) ||
@@ -92,12 +137,14 @@ mlx::core::array grouped_expert(
     }
   }
   std::vector<array> inputs = gate.inputs();
-  inputs.insert(inputs.end(), up.inputs().begin(), up.inputs().end());
+  if (!paired) {
+    inputs.insert(inputs.end(), up.inputs().begin(), up.inputs().end());
+  }
   inputs.push_back(activation.inputs()[2]);
   inputs.push_back(activation.inputs()[3]);
   inputs.insert(inputs.end(), down.inputs().begin() + 1, down.inputs().end());
   return array(down.shape(), down.dtype(),
-               std::make_shared<GroupedExpert>(s, gate, up, activation, down),
+               std::make_shared<GroupedExpert>(s, gate, up, activation, down, paired),
                std::move(inputs));
 }
 } // namespace omlx::quant_matmul

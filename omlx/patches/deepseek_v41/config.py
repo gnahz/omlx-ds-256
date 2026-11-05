@@ -98,6 +98,9 @@ class ModelConfig:
     vision_max_wh_ratio: int | None = None
     # raw id of <｜deepseek_image｜>; every position of an image span carries this id in input_ids
     image_token_id: int = 129264
+    # 1017 adds a group-32 FP8 round trip before the BF16 wo_a projection.
+    # Explicit metadata distinguishes checkpoints whose official configs match.
+    attention_output_quantization: bool = False
     # Draft weights and standalone forward are separate from server verification.
     preserve_mtp: bool = False
     # CED prefill skip: the decoder half forwards only the trailing
@@ -156,6 +159,9 @@ class ModelConfig:
         values["preserve_mtp"] = bool(
             config.get("omlx_deepseek_v41", {}).get("preserve_mtp", False)
         )
+        values["attention_output_quantization"] = config.get(
+            "omlx_deepseek_v41", {}
+        ).get("attention_output_quantization", False)
         rope = text.get("rope_scaling") or {}
         values.update(
             {
@@ -188,6 +194,8 @@ class ModelConfig:
         return result
 
     def validate(self):
+        if type(self.attention_output_quantization) is not bool:
+            raise ValueError("attention_output_quantization must be a boolean")
         if len(self.compress_ratios) < self.n_layers:
             raise ValueError("compress_ratios must cover every backbone layer")
         if self.n_heads % self.o_groups or self.head_dim % 32:

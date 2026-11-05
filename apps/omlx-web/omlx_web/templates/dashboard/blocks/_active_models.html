@@ -191,6 +191,12 @@
                         </div>
                     </div>
                 </div>
+                <!-- Aggregate only current decoders using the existing recent samples. -->
+                <div x-show="!m.is_loading" class="mt-2 ml-5 flex flex-wrap items-center" style="gap: 4px 16px;">
+                    <span class="text-xs font-medium text-neutral-600">{{ t('status.active_models.total_decode_rate') if t('status.active_models.total_decode_rate') != 'status.active_models.total_decode_rate' else 'Total output' }}</span>
+                    <span data-total-decode-rate class="text-sm font-semibold text-green-600" style="font-variant-numeric: tabular-nums;"
+                          x-text="window.t('status.active_models.recent_decode_rate').replace('{rate}', (m.generating || []).some(gen => !Number.isFinite(gen.recent_tokens_per_second)) ? '—' : (m.generating || []).reduce((sum, gen) => sum + gen.recent_tokens_per_second, 0).toFixed(1) + ' tok/s')"></span>
+                </div>
                 <!-- Prefill sub-rows -->
                 <template x-if="m.prefilling && m.prefilling.length > 0">
                     <div class="mt-2 ml-5 space-y-1.5">
@@ -223,7 +229,9 @@
                                     <span class="text-caption text-green-700 font-medium" x-text="window.t('status.active_models.generating')"></span>
                                 </span>
                                 <span class="text-caption text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
-                                <span x-show="gen.tokens_per_second > 0" class="text-caption text-neutral-400 w-20 whitespace-nowrap"
+                                <span x-show="gen.recent_tokens_per_second !== undefined" class="text-caption text-neutral-400 whitespace-nowrap"
+                                      x-text="window.t('status.active_models.recent_decode_rate').replace('{rate}', gen.recent_tokens_per_second == null ? '—' : gen.recent_tokens_per_second.toFixed(1) + ' tok/s')"></span>
+                                <span x-show="gen.recent_tokens_per_second === undefined && gen.tokens_per_second > 0" class="text-caption text-neutral-400 w-20 whitespace-nowrap"
                                       x-text="gen.tokens_per_second.toFixed(1) + ' tok/s'"></span>
                                 <span x-show="gen.last_activity_age_seconds >= 3" class="text-caption text-neutral-400 whitespace-nowrap" x-text="formatActivityAge(gen.last_activity_age_seconds)"></span>
                                 <span x-show="gen.elapsed_seconds != null" class="text-caption text-neutral-400 whitespace-nowrap"
@@ -232,7 +240,96 @@
                         </template>
                     </div>
                 </template>
-                <!-- Non-streaming activity sub-rows -->
+                <!-- Entrance queue is outside the four occupied pipeline slots. -->
+                <div x-show="m.request_limit != null" class="mt-1.5 ml-5 flex flex-wrap items-center gap-3 text-caption text-neutral-500">
+                    <span x-text="window.t('status.active_models.pipeline_slots') + ': ' + (m.admitted_requests || 0) + ' / ' + m.request_limit"></span>
+                    <span x-text="window.t('status.active_models.entrance_queue') + ': ' + (m.queued_requests || 0)"></span>
+                </div>
+                <template x-if="m.memory_budget && m.memory_budget.current_bytes != null">
+                    <div class="mt-2 ml-5 text-caption text-neutral-500" style="border-top: 1px solid #e5e7eb; padding-top: 10px;">
+                        <div data-budget-usage style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 20px;">
+                            <template x-for="field in ['current', 'reserved', 'available']" :key="field">
+                                <div>
+                                    <span style="display: block; margin-bottom: 2px;" x-text="window.t('status.active_models.budget_' + field)"></span>
+                                    <span class="text-xs font-medium text-neutral-700" style="font-variant-numeric: tabular-nums;" x-text="(m.memory_budget[field + '_bytes'] / 1073741824).toFixed(2) + ' GiB'"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <div data-budget-limits class="flex flex-wrap" style="gap: 6px 24px; margin-top: 10px;">
+                            <template x-for="field in ['limit', 'process_limit']" :key="field">
+                                <span x-text="window.t('status.active_models.budget_' + field) + ': ' + (m.memory_budget[field + '_bytes'] / 1073741824).toFixed(2) + ' GiB'"></span>
+                            </template>
+                        </div>
+                        <template x-if="m.memory_budget.system_free_bytes != null">
+                            <div data-budget-system class="flex flex-wrap" style="gap: 6px 24px; margin-top: 8px;">
+                                <template x-for="field in ['system_free', 'system_free_reserve']" :key="field">
+                                    <span x-text="window.t('status.active_models.budget_' + field) + ': ' + (m.memory_budget[field + '_bytes'] / 1073741824).toFixed(2) + ' GiB'"></span>
+                                </template>
+                            </div>
+                        </template>
+                        <template x-if="m.memory_budget.decode_guard">
+                            <div data-decode-budget-guard style="margin-top: 10px;">
+                                <div class="text-amber-600 font-medium"
+                                     x-show="m.memory_budget.decode_guard.state !== 'running'"
+                                     x-text="window.t('status.active_models.decode_guard_' + m.memory_budget.decode_guard.state)"></div>
+                                <details x-show="m.memory_budget.decode_guard.last_failure" style="margin-top: 6px;">
+                                    <summary style="cursor: pointer;" x-text="window.t('status.active_models.decode_guard_details')"></summary>
+                                    <pre style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; padding: 8px; background: #f5f5f5;"
+                                         x-text="JSON.stringify(m.memory_budget.decode_guard.last_failure, null, 2)"></pre>
+                                </details>
+                            </div>
+                        </template>
+                        <template x-if="m.memory_budget.prefill_guard">
+                            <div data-prefill-budget-guard style="margin-top: 10px;">
+                                <div class="text-amber-600 font-medium"
+                                     x-show="m.memory_budget.prefill_guard.waiting_request_ids.length > 0"
+                                     x-text="window.t('status.active_models.prefill_guard_waiting')"></div>
+                                <details x-show="m.memory_budget.prefill_guard.last_failure" style="margin-top: 6px;">
+                                    <summary style="cursor: pointer;" x-text="window.t('status.active_models.prefill_guard_details')"></summary>
+                                    <pre style="white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; padding: 8px; background: #f5f5f5;"
+                                         x-text="JSON.stringify(m.memory_budget.prefill_guard.last_failure, null, 2)"></pre>
+                                </details>
+                            </div>
+                        </template>
+                        <template x-if="m.memory_budget.pending">
+                            <div data-budget-pending class="text-amber-600" style="margin-top: 10px; padding: 8px 10px; border-left: 3px solid #fbbf24; background: #fffbeb; border-radius: 4px;">
+                                <div class="font-medium" style="margin-bottom: 6px;" x-text="window.t('status.active_models.budget_head') + ' · ' + m.memory_budget.pending.request_id.substring(0, 8)"></div>
+                                <div data-budget-pending-details style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 20px;">
+                                    <div>
+                                        <span style="display: block;" x-text="window.t('status.active_models.budget_required')"></span>
+                                        <span class="font-medium" x-text="((m.memory_budget.pending.required_bytes ?? m.memory_budget.pending.envelope.total_bytes) / 1073741824).toFixed(2) + ' GiB'"></span>
+                                    </div>
+                                    <div>
+                                        <span style="display: block;" x-text="window.t('status.active_models.budget_shortfall')"></span>
+                                        <span class="font-medium" x-text="(m.memory_budget.pending.shortfall_bytes / 1073741824).toFixed(2) + ' GiB'"></span>
+                                    </div>
+                                    <div>
+                                        <span style="display: block;" x-text="window.t('status.active_models.budget_context')"></span>
+                                        <span class="font-medium" x-text="formatTokenCount(m.memory_budget.pending.envelope.context_tokens) + ' tok'"></span>
+                                    </div>
+                                    <div x-show="m.memory_budget.pending.envelope.prefill_chunk_tokens > 0">
+                                        <span style="display: block;" x-text="window.t('status.active_models.budget_prefill_chunk')"></span>
+                                        <span class="font-medium" x-text="(m.memory_budget.pending.envelope.prefill_chunk_tokens || 0) + ' tok'"></span>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
+                        <div x-show="m.memory_budget.shared_transient_bytes > 0" style="margin-top: 8px;"
+                             x-text="window.t('status.active_models.budget_shared') + ': ' + ((m.memory_budget.shared_transient_bytes || 0) / 1073741824).toFixed(2) + ' GiB'"></div>
+                        <div style="margin-top: 8px; max-width: 480px;">
+                            <template x-for="reservation in m.memory_budget.reservations || []" :key="reservation.request_id">
+                                <div data-budget-reservation style="display: grid; grid-template-columns: 72px minmax(0, 1fr) auto; gap: 4px 12px; padding: 3px 0;">
+                                    <span class="font-mono" x-text="reservation.request_id.substring(0, 8)"></span>
+                                    <span x-text="window.t('status.active_models.budget_' + reservation.phase)"></span>
+                                    <span style="font-variant-numeric: tabular-nums;" x-text="(reservation.reserved_bytes / 1073741824).toFixed(2) + ' GiB'"></span>
+                                    <span data-budget-prefill-chunk x-show="reservation.prefill_chunk_tokens > 0" style="grid-column: 1 / -1;" x-text="window.t('status.active_models.budget_prefill_chunk') + ': ' + (reservation.prefill_chunk_tokens || 0) + ' tok'"></span>
+                                    <span x-show="reservation.next_capacity_bytes != null" style="grid-column: 1 / -1; color: #737373;" x-text="window.t('status.active_models.budget_context') + ': ' + formatTokenCount(reservation.context_tokens) + ' tok · ' + window.t('status.active_models.budget_capacity') + ': ' + ((reservation.current_capacity_bytes || 0) / 1073741824).toFixed(2) + ' → ' + ((reservation.next_capacity_bytes || 0) / 1073741824).toFixed(2) + ' GiB · ' + window.t('status.active_models.budget_workspace') + ': ' + ((reservation.decode_workspace_bytes || 0) / 1073741824).toFixed(2) + ' GiB'"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+                <!-- Preparation and other engine activity sub-rows -->
                 <template x-if="m.activities && m.activities.length > 0">
                     <div class="mt-1.5 ml-5 space-y-1.5">
                         <template x-for="activity in m.activities" :key="activity.request_id">
@@ -240,7 +337,12 @@
                                 <span class="text-caption font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
                                 <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
                                     <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
-                                    <span class="text-caption text-green-700 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                    <span class="text-caption font-medium"
+                                           :class="activity.kind === 'request_preparation' ? 'text-amber-700' : 'text-green-700'"
+                                          x-text="activity.kind === 'request_preparation'
+                                              ? window.t('status.active_models.' + (activity.phase === 'cancelling' ? 'cancelling' : 'preparing'))
+                                              : activity.kind === 'pipeline_cleanup' ? window.t('status.active_models.draining')
+                                              : activity.detail || activity.kind || window.t('status.active_models.active')"></span>
                                 </span>
                                 <span x-show="formatActivityMetadata(activity)" class="text-caption text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
                                 <span x-show="activity.elapsed_seconds != null" class="text-caption text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
@@ -252,11 +354,12 @@
                 <template x-if="m.waiting && m.waiting.length > 0">
                     <div class="mt-1.5 ml-5 space-y-1.5">
                         <template x-for="wait in m.waiting" :key="wait.request_id">
-                            <div class="flex items-center gap-2">
+                            <div class="flex flex-wrap items-center gap-2">
                                 <span class="text-caption font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
                                 <span class="w-2 h-2 rounded-full bg-amber-300"></span>
                                 <span class="text-caption text-amber-700 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                 <span class="text-caption text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
+                                <span x-show="wait.reason === 'context_budget'" class="text-caption text-amber-600" x-text="window.t('status.active_models.memory_budget_wait')"></span>
                                 <span x-show="wait.prompt_tokens > 0" class="text-caption text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', formatTokenCount(wait.prompt_tokens))"></span>
                             </div>
                         </template>
@@ -266,8 +369,8 @@
         </template>
     </div>
     <!-- Footer: Active/Waiting totals -->
-    <div x-show="stats.active_models.total_active_requests > 0 || stats.active_models.total_waiting_requests > 0"
-         class="px-6 py-3 bg-neutral-50 border-t border-neutral-100 flex items-center gap-3">
+    <div x-show="stats.active_models.total_active_requests > 0 || stats.active_models.total_waiting_requests > 0 || stats.active_models.total_queued_requests > 0"
+         class="px-6 py-3 bg-neutral-50 border-t border-neutral-100 flex flex-wrap items-center gap-3">
         <span x-show="stats.active_models.total_active_requests > 0"
               class="text-xs text-neutral-500">
             <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.active') + ': ' + stats.active_models.total_active_requests"></span>
@@ -277,6 +380,9 @@
         <span x-show="stats.active_models.total_waiting_requests > 0"
               class="text-xs text-neutral-500">
             <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.waiting') + ': ' + stats.active_models.total_waiting_requests"></span>
+        </span>
+        <span x-show="stats.active_models.total_queued_requests > 0" class="text-xs text-neutral-500">
+            <span class="font-medium text-neutral-600" x-text="window.t('status.active_models.entrance_queue') + ': ' + stats.active_models.total_queued_requests"></span>
         </span>
     </div>
 </div>

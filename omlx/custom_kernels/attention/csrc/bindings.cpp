@@ -19,6 +19,22 @@ using namespace nb::literals;
 NB_MODULE(_ext, m) {
   m.doc() = "Native attention kernels for oMLX";
 
+  m.attr("PACKED_SPARSE_WORKSPACE_ABI") = 1;
+  m.def(
+      "packed_sparse_attention_workspace",
+      [](int64_t batch, int64_t queries, int64_t local_rows, int64_t pooled_rows) {
+        const auto plan = omlx::attention::packed_sparse_attention_workspace(
+            batch, queries, local_rows, pooled_rows);
+        nb::dict result;
+        result["abi"] = 1;
+        result["unpack_kv"] = plan.unpack_kv;
+        result["unique_kv_bytes"] = plan.unique_kv_bytes;
+        result["scratch_bytes"] = plan.scratch_bytes;
+        result["scratch_limit_bytes"] = size_t(80 * 1024 * 1024);
+        return result;
+      },
+      "batch"_a, "queries"_a, "local_rows"_a, "pooled_rows"_a);
+
   // ABI canary: when the extension is built with a nanobind whose ABI tag
   // differs from the one the mlx wheel was built with, the NB_DOMAIN is
   // isolated and every mx.array argument is rejected with "incompatible
@@ -108,6 +124,19 @@ NB_MODULE(_ext, m) {
   m.def(
       "packed_sparse_attention",
       &omlx::attention::packed_sparse_attention,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "topk_indices"_a,
+      "sinks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "compress_ratio"_a,
+      "local_window"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "packed_sparse_attention_single_decode",
+      &omlx::attention::packed_sparse_attention_single_decode,
       "q"_a,
       "local_kv"_a,
       "pooled"_a,

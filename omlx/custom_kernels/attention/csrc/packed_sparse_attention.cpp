@@ -1,4 +1,5 @@
 #include "packed_sparse_attention.h"
+#include "single_decode_jit_source.h"
 #include "omlx/binary_dir.h"
 
 #include <algorithm>
@@ -51,7 +52,8 @@ class PackedSparseAttentionPrimitive : public Primitive {
       int q_offset,
       int compress_ratio,
       int local_window,
-      Stream s) {
+      Stream s,
+      bool single_decode) {
     if (s.device == Device::cpu) {
       return true;
     }
@@ -79,7 +81,8 @@ class PackedSparseAttentionPrimitive : public Primitive {
         sinks.shape(0) != q.shape(1)) {
       return true;
     }
-    if (q.shape(2) <= 1 || local_kv.shape(2) < q.shape(2) ||
+    if (q.shape(2) <= 0 || (!single_decode && q.shape(2) == 1) ||
+        local_kv.shape(2) < q.shape(2) ||
         topk_indices.dtype() != uint32) {
       return true;
     }
@@ -161,19 +164,21 @@ class PackedSparseAttentionPrimitive : public Primitive {
     }
 
     // Long prefill chunks decode each KV row once into temporary BF16 rows.
-    // The scratch budget grows with the chunk (80 KiB per query, 80-512 MiB);
-    // longer contexts keep reading packed rows.
-    const size_t unpack_bytes =
-        size_t(B) * (localL + std::max(pooledL, 1)) * dim * sizeof(uint16_t);
-    const size_t unpack_budget = std::min(
-        size_t(512 * 1024 * 1024),
-        std::max(size_t(80 * 1024 * 1024), size_t(qL) * 80 * 1024));
-    const bool unpack_kv = qL >= 256 && unpack_bytes <= unpack_budget;
+    // The scratch is bounded, so very long contexts keep reading packed rows.
+    const auto workspace =
+        packed_sparse_attention_workspace(B, qL, localL, pooledL);
+    const bool unpack_kv = workspace.unpack_kv;
     if (unpack_kv) {
       base_name += "_unpacked";
     }
 
-    auto lib = d.get_library("omlx_attention_kernels", binary_dir());
+    // The selected production singleton path historically used this safe-mode
+    // runtime-compiled source. Preserve its exact compiler arithmetic while
+    // leaving stable prefill/verification on the unchanged ahead-of-time library.
+    auto lib = qL == 1
+        ? d.get_library("omlx_deepseek_v41_single_decode", CompileOptions{},
+                        qualified_deepseek_v41_single_decode_source)
+        : d.get_library("omlx_attention_kernels", binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);
     auto kernel = d.get_kernel(base_name, lib);
 
@@ -267,7 +272,7 @@ class PackedSparseAttentionPrimitive : public Primitive {
 
 } // namespace
 
-array packed_sparse_attention(
+static array packed_sparse_attention_impl(
     const array& q,
     const array& local_kv,
     const array& pooled,
@@ -277,7 +282,8 @@ array packed_sparse_attention(
     int q_offset,
     int compress_ratio,
     int local_window,
-    StreamOrDevice s) {
+    StreamOrDevice s,
+    bool single_decode) {
   if (q.ndim() != 4 || local_kv.ndim() != 4 || pooled.ndim() != 3 ||
       topk_indices.ndim() != 4 || sinks.ndim() != 1) {
     std::ostringstream msg;
@@ -299,6 +305,13 @@ array packed_sparse_attention(
         << pooled.shape() << ", " << topk_indices.shape() << ", "
         << sinks.shape() << ".";
     throw std::invalid_argument(msg.str());
+  }
+  // Preserve the qualified old native decode case, without broadening stable
+  // prefill admission or introducing singleton pooled attention.
+  if (single_decode &&
+      (q.shape(2) != 1 || pooled.shape(1) != 0 || topk_indices.shape(3) != 0)) {
+    throw std::invalid_argument(
+        "[attention.packed_sparse_attention_single_decode] expected one query and no pooled rows or indices.");
   }
   if (topk_indices.dtype() != uint32) {
     std::ostringstream msg;
@@ -330,7 +343,8 @@ array packed_sparse_attention(
           q_offset,
           compress_ratio,
           local_window,
-          stream)) {
+          stream,
+          single_decode)) {
     throw std::invalid_argument(
         "[attention.packed_sparse_attention] unsupported DeepSeek V4.1 packed attention shape.");
   }
@@ -344,6 +358,39 @@ array packed_sparse_attention(
       std::make_shared<PackedSparseAttentionPrimitive>(
           stream, scale, q_offset, compress_ratio, local_window),
       std::move(inputs));
+}
+
+
+array packed_sparse_attention(
+    const array& q,
+    const array& local_kv,
+    const array& pooled,
+    const array& topk_indices,
+    const array& sinks,
+    float scale,
+    int q_offset,
+    int compress_ratio,
+    int local_window,
+    StreamOrDevice s) {
+  return packed_sparse_attention_impl(
+      q, local_kv, pooled, topk_indices, sinks, scale, q_offset,
+      compress_ratio, local_window, s, false);
+}
+
+array packed_sparse_attention_single_decode(
+    const array& q,
+    const array& local_kv,
+    const array& pooled,
+    const array& topk_indices,
+    const array& sinks,
+    float scale,
+    int q_offset,
+    int compress_ratio,
+    int local_window,
+    StreamOrDevice s) {
+  return packed_sparse_attention_impl(
+      q, local_kv, pooled, topk_indices, sinks, scale, q_offset,
+      compress_ratio, local_window, s, true);
 }
 
 } // namespace omlx::attention

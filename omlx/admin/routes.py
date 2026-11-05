@@ -1470,6 +1470,16 @@ async def _apply_cache_settings_runtime(
     from ..config import parse_size
     from ..server import _server_state
 
+    exact_runtime = getattr(_server_state, "exact_prefix_cache_runtime", None)
+    if exact_runtime is not None:
+        # The exact backend owns separate RAM and SSD tiers. Constructing a
+        # native paged manager or unloading engines here would bypass its
+        # profile and could race pending checkpoint writes.
+        try:
+            return await exact_runtime.apply_native_settings(global_settings)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
 
@@ -4800,6 +4810,24 @@ async def update_global_settings(
     request: GlobalSettingsRequest,
     is_admin: bool = Depends(require_admin),
 ):
+    exact_runtime = _get_exact_cache_runtime()
+    if exact_runtime is None:
+        return await _update_global_settings(request, is_admin)
+    # Serialize settings read/modify/persist as one operation for this service.
+    # Cache callbacks use their separate engine-mutation lock.
+    async with exact_runtime.native_settings_lock:
+        import copy
+        settings = _get_global_settings()
+        previous_cache = copy.deepcopy(settings.cache) if settings is not None else None
+        try:
+            return await _update_global_settings(request, is_admin)
+        except BaseException:
+            if previous_cache is not None:
+                settings.cache = previous_cache
+            raise
+
+
+async def _update_global_settings(request: GlobalSettingsRequest, is_admin: bool):
     """
     Update global server settings.
 
@@ -4821,6 +4849,16 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    exact_runtime = _get_exact_cache_runtime()
+    exact_previous_cache = None
+    if exact_runtime is not None:
+        import copy
+        exact_previous_cache = copy.deepcopy(global_settings.cache)
+        try:
+            exact_runtime.validate_native_settings_request(request, global_settings)
+        except (ValueError, TypeError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     from ..utils.network import (
         is_loopback_bind,
@@ -5406,7 +5444,7 @@ async def update_global_settings(
         else:
             os.environ.pop("OMLX_QWEN35_ANE_COMPILE_CACHE", None)
 
-    if cache_changed:
+    if cache_changed and exact_runtime is None:
         success, msg = await _apply_cache_settings_runtime(
             request.cache_enabled,
             global_settings,
@@ -5901,9 +5939,25 @@ async def update_global_settings(
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
+    if cache_changed and exact_runtime is not None:
+        success, msg = await _apply_cache_settings_runtime(
+            request.cache_enabled, global_settings,
+            hot_cache_max_size=request.hot_cache_max_size)
+        if success:
+            runtime_applied.append("cache")
+            logger.info(msg)
     try:
         await _save_global_settings_async(global_settings)
     except Exception as e:
+        if cache_changed and exact_runtime is not None:
+            global_settings.cache = exact_previous_cache
+            try:
+                await exact_runtime.apply_native_settings(global_settings)
+            except Exception as rollback_error:
+                logger.error("Exact SSD configuration rollback failed: %s", rollback_error)
+                exact_runtime.ready = False
+                exact_runtime.error = "Exact SSD settings save and runtime rollback failed; restart required"
+                raise HTTPException(status_code=500, detail="Settings save and exact SSD runtime rollback failed") from rollback_error
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
@@ -6465,6 +6519,47 @@ def _scan_offline_gdn_sidecars(
     return count, total_bytes
 
 
+def _get_exact_cache_runtime():
+    state = _get_server_state() if callable(_get_server_state) else None
+    return getattr(state, "exact_prefix_cache_runtime", None)
+
+
+def _exact_cache_observability(exact):
+    """Map exact L1/L2 accounting into the existing dashboard's cache shape."""
+    l2 = exact.get("l2", {})
+    l2 = l2 if isinstance(l2, dict) else {}
+    hits, misses = int(l2.get("hits", 0)), int(l2.get("misses", 0))
+    total_hits = int(exact.get("hits", 0))
+    ram_hits = int(exact.get("ram_hits", max(0, total_hits - hits)))
+    l2_hits = int(exact.get("l2_hits", hits))
+    return {
+        "cache_tier": "deepseek-exact-l2",
+        "backend": str(l2.get("backend", "deepseek_v41_exact_l2_v1")),
+        "exact_prefix_cache": exact,
+        "num_files": int(l2.get("entries", 0)),
+        "total_size_bytes": int(l2.get("disk_bytes", 0)),
+        "max_size_bytes": int(l2.get("max_bytes", 0)),
+        "hot_cache_max_bytes": int(exact.get("max_bytes", 0)),
+        "hot_cache_size_bytes": int(exact.get("bytes", 0)),
+        "hot_cache_entries": int(exact.get("checkpoints", 0)),
+        "hits": hits, "misses": misses,
+        "loads": int(l2.get("reads", 0)), "saves": int(l2.get("writes", 0)),
+        "read_bytes": int(l2.get("read_bytes", 0)), "write_bytes": int(l2.get("write_bytes", 0)),
+        "errors": int(l2.get("read_failures", 0)) + int(l2.get("write_failures", 0)),
+        "pending_bytes": int(l2.get("pending_bytes", 0)),
+        "evictions": int(l2.get("evictions", 0)),
+        "cache_rates": {"cumulative": {
+            "prefix_hits": total_hits, "prefix_misses": misses,
+            "prefix_hit_rate": total_hits / (total_hits + misses) if total_hits + misses else 0,
+            "ssd_hot_hits": ram_hits, "ssd_disk_loads": l2_hits,
+            "ssd_hot_rate": ram_hits / total_hits if total_hits else 0,
+            "ssd_saves": int(l2.get("writes", 0)),
+            "evictions": int(l2.get("evictions", 0)),
+            "hot_cache_evictions": int(exact.get("evictions", 0)),
+        }},
+    }
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -6723,16 +6818,27 @@ def _build_runtime_cache_observability(
             "gdn_staging": gdn_staging_payload,
         }
 
+        exact_stats = runtime_stats.get("exact_prefix_cache")
+        if isinstance(exact_stats, dict):
+            model_payload.update(_exact_cache_observability(exact_stats))
+            # Exact checkpoints have token endpoints rather than paged blocks.
+            model_payload.update(block_size=0, indexed_blocks=0)
+            block_size = 0
+            payload["backend"] = "deepseek_v41_exact_l2_v1"
+            l2_dir = exact_stats.get("l2", {}).get("directory")
+            if l2_dir:
+                payload["ssd_cache_dir"] = str(l2_dir)
+
         if boundary_snapshots is not None:
             model_payload["boundary_snapshots"] = boundary_snapshots
         if last_prefix_lookup is not None:
             model_payload["last_prefix_lookup"] = last_prefix_lookup
 
         for field in ssd_counter_fields:
-            if field in ssd_stats:
+            if field in ssd_stats and not isinstance(exact_stats, dict):
                 model_payload[field] = int(ssd_stats.get(field, 0) or 0)
 
-        cache_rates = runtime_stats.get("cache_rates")
+        cache_rates = runtime_stats.get("cache_rates") if not isinstance(exact_stats, dict) else None
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
 
@@ -6896,6 +7002,8 @@ def _build_active_models_data() -> dict:
     """Build active models status for the dashboard Active Models card."""
     from ..model_discovery import format_size
     from ..prefill_progress import get_prefill_tracker
+    from ..request_preparation import get_request_preparation_tracker
+    from ..request_admission import get_request_admission
 
     engine_pool = _get_engine_pool()
     server_state = _get_server_state()
@@ -6916,10 +7024,13 @@ def _build_active_models_data() -> dict:
             },
             "total_active_requests": 0,
             "total_waiting_requests": 0,
+            "total_queued_requests": 0,
+            "total_admitted_requests": 0,
         }
 
     now = time.monotonic()
     tracker = get_prefill_tracker()
+    preparation_tracker = get_request_preparation_tracker()
     status = engine_pool.get_status()
     enforcer = (
         getattr(server_state, "process_memory_enforcer", None)
@@ -6935,19 +7046,25 @@ def _build_active_models_data() -> dict:
     models = []
     total_active = 0
     total_waiting = 0
+    total_queued = 0
+    total_admitted = 0
 
     for model_info in status.get("models", []):
         if not model_info.get("loaded") and not model_info.get("is_loading"):
             continue
 
         model_id = model_info["id"]
+        entrance = get_request_admission().snapshot(model_id)
+        # Read preparation first. Handoff publishes the scheduler snapshot
+        # before clearing preparation, so the request remains visible.
+        preparing = preparation_tracker.get_model_activities(model_id)
         active_requests = 0
-        waiting_requests = 0
         running_by_id = {}
         has_scheduler_snapshot = False
+        waiting_queue = []
         waiting_ids = set()
-        waiting = []
         activities = []
+        memory_budget = {}
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -6980,17 +7097,8 @@ def _build_active_models_data() -> dict:
                 has_scheduler_snapshot = True
                 running_by_id = snap["running_by_id"]
                 waiting_queue = snap["waiting"]
-                waiting_requests = len(waiting_queue)
+                memory_budget = snap.get("memory_budget", {})
                 waiting_ids = {req.request_id for req in waiting_queue}
-                waiting = [
-                    {
-                        "request_id": req.request_id,
-                        "queue_position": idx,
-                        "elapsed_seconds": max(0.0, now - req.arrival_time),
-                        "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
-                    }
-                    for idx, req in enumerate(waiting_queue, start=1)
-                ]
             if hasattr(entry.engine, "get_activity_snapshot"):
                 # Requests the engine tracks itself (non-streaming and
                 # external engines). Counted on top of any scheduler
@@ -6998,6 +7106,8 @@ def _build_active_models_data() -> dict:
                 snapshot = entry.engine.get_activity_snapshot()
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
+                if not has_scheduler_snapshot:
+                    memory_budget = snapshot.get("memory_budget", {})
 
         # Cluster (distributed) engines own no local scheduler or collectors;
         # their live stats come from rank zero's telemetry marker instead.
@@ -7037,7 +7147,7 @@ def _build_active_models_data() -> dict:
 
         # Generating = active requests that finished prefill.
         generating = []
-        for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
+        for rid in sorted(active_request_ids - prefilling_ids):
             req = running_by_id.get(rid)
             generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0
             started_at = getattr(req, "generation_started_at", None) if req else None
@@ -7049,12 +7159,16 @@ def _build_active_models_data() -> dict:
             tokens_per_second = (
                 generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
             )
+            recent_decode_rate = getattr(req, "recent_decode_tokens_per_second", None)
             generating.append(
                 {
                     "request_id": rid,
                     "elapsed_seconds": elapsed,
                     "generated_tokens": generated_tokens,
                     "tokens_per_second": tokens_per_second,
+                    "recent_tokens_per_second": (
+                        recent_decode_rate(now) if callable(recent_decode_rate) else None
+                    ),
                     "last_activity_age_seconds": last_activity_age,
                     "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
@@ -7108,6 +7222,34 @@ def _build_active_models_data() -> dict:
                             "max_tokens": None,
                         }
                     )
+
+        # Prefill progress is live while the scheduler snapshot may still
+        # include the same request in its previous waiting queue.
+        visible_ids = {row["request_id"] for row in (*prefilling, *generating, *activities)}
+        waiting_by_id = {
+            req.request_id: req
+            for req in waiting_queue
+            if req.request_id not in visible_ids
+        }
+        waiting = [
+            {
+                "request_id": req.request_id,
+                "queue_position": idx,
+                "elapsed_seconds": max(0.0, now - req.arrival_time),
+                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                **({"reason": "context_budget"} if getattr(req, "memory_wait_reason", None) == "context_budget" else {}),
+            }
+            for idx, req in enumerate(waiting_by_id.values(), start=1)
+        ]
+        waiting_requests = len(waiting)
+        visible_ids.update(waiting_by_id)
+        preparing = [row for row in preparing if row["request_id"] not in visible_ids]
+        active_requests += len(preparing)
+        activities = [*preparing, *activities]
+        visible_ids.update(row["request_id"] for row in activities)
+        draining = [row for row in entrance["draining"] if row["request_id"] not in visible_ids]
+        activities.extend(draining)
+        active_requests += len(draining)
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (
@@ -7188,6 +7330,8 @@ def _build_active_models_data() -> dict:
                 "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
                 "active_requests": active_requests,
                 "waiting_requests": waiting_requests,
+                **entrance,
+                "memory_budget": memory_budget,
                 "waiting": waiting,
                 "activities": activities,
                 "prefilling": prefilling,
@@ -7204,6 +7348,8 @@ def _build_active_models_data() -> dict:
 
         total_active += active_requests
         total_waiting += waiting_requests
+        total_queued += entrance["queued_requests"]
+        total_admitted += entrance["admitted_requests"]
 
     # model_memory_used reports phys_footprint (whole process) when the
     # enforcer is running so the UI's usage bar matches the value used to
@@ -7259,6 +7405,8 @@ def _build_active_models_data() -> dict:
         },
         "total_active_requests": total_active,
         "total_waiting_requests": total_waiting,
+        "total_queued_requests": total_queued,
+        "total_admitted_requests": total_admitted,
     }
 
 
@@ -7337,6 +7485,12 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     direct filesystem deletion so caches can be wiped even when no model
     is loaded.
     """
+    exact_runtime = _get_exact_cache_runtime()
+    if exact_runtime is not None:
+        try:
+            return await exact_runtime.clear_native_cache(ssd=True)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     total_deleted = 0
     distributed_ranks = 0
     distributed_failures = []
@@ -7465,6 +7619,12 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
     synchronized clear path so active engine streams and async store-cache
     workers keep the same Metal safety barriers used by generation.
     """
+    exact_runtime = _get_exact_cache_runtime()
+    if exact_runtime is not None:
+        try:
+            return await exact_runtime.clear_native_cache(ssd=False)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     import gc
 
     from ..engine_core import get_mlx_executor

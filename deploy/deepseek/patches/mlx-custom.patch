@@ -1,0 +1,790 @@
+Local DeepSeek LSQ3/G128 MLX customization
+Base: https://github.com/ml-explore/mlx at 36969c094354086e15d2a327a9c50feb20b9cf11
+The upstream source and this patch retain the following license:
+
+MIT License
+
+Copyright © 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+index aad94eba1e1752c58b94de4c744b7c4f865888e9..a432efe62f41286b9467a1a9d87845990c40674b 100644
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -1305,6 +1305,24 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
+   return d.get_kernel(kernel_name, lib);
+ }
+ 
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    int bm) {
++  auto lib = d.get_library(kernel_name, [&]() {
++    std::string kernel_source;
++    concatenate(
++        kernel_source,
++        metal::utils(),
++        metal::gemm_nax(),
++        metal::quantized_utils(),
++        metal::quantized_nax(),
++        get_template_definition(kernel_name, "gather_rhs_tiles", bm));
++    return kernel_source;
++  });
++  return d.get_kernel(kernel_name, lib);
++}
++
+ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+@@ -1333,7 +1351,9 @@ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
+     // Only the fp kernel takes a global scale.
+     auto template_def = is_affine ? get_template_definition(
+                                         lib_name,
+-                                        "affine_gather_qmm_rhs_nax",
++                                        kernel_name.rfind("qualified_", 0) == 0
++                                            ? "qualified_affine_gather_qmm_rhs_nax"
++                                            : "affine_gather_qmm_rhs_nax",
+                                         get_type_string(x.dtype()),
+                                         group_size,
+                                         bits,
+diff --git a/mlx/backend/metal/kernels.h b/mlx/backend/metal/kernels.h
+index ded6c834abceca4e2cec94ca1b9c5efeaf594e36..3dae7cd93e7c261e0cfcfa999c32dfcd9c3bc5dd 100644
+--- a/mlx/backend/metal/kernels.h
++++ b/mlx/backend/metal/kernels.h
+@@ -399,6 +399,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
+     const std::string& template_def,
+     const std::string& mode);
+ 
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d, const std::string& kernel_name, int bm);
++
+ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+diff --git a/mlx/backend/metal/kernels/quantized_nax.h b/mlx/backend/metal/kernels/quantized_nax.h
+index 95f26868fc5a32f505d055e822a36d7bc4c6f038..70245e386755866ea108c35741baf81ba7b5980c 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.h
++++ b/mlx/backend/metal/kernels/quantized_nax.h
+@@ -1767,3 +1767,363 @@ template <
+     });
+   });
+ }
++
++
++// Qualified LSQ3/G128 gather path; ordinary MLX dispatch stays unchanged.
++constant bool use_tiles [[function_constant(203)]];
++constant bool gather_x [[function_constant(204)]];
++
++template <
++    typename T,
++    int group_size,
++    const int bits,
++    int BM,
++    int BN,
++    int BK,
++    int WM,
++    int WN,
++    bool transpose>
++[[kernel]] void qualified_affine_gather_qmm_rhs_nax(
++    const device T* x,
++    const device uint32_t* w,
++    const device T* scales,
++    const device T* biases,
++    const device uint32_t* indices,
++    device T* y,
++    const constant int& M,
++    const constant int& N,
++    const constant int& K,
++    const device int2* tiles [[buffer(9), function_constant(use_tiles)]],
++    const device uint32_t* x_rows [[buffer(10), function_constant(gather_x)]],
++    uint3 tid [[threadgroup_position_in_grid]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]],
++    uint simd_lane_id [[thread_index_in_simdgroup]]) {
++  // With tiles, each threadgroup owns rows [x, y) of one expert.
++  int2 tile = use_tiles ? tiles[tid.y] : int2(tid.y * BM, M);
++  if (use_tiles && tile.x >= tile.y) {
++    return;
++  }
++  constexpr int pack_factor = get_pack_factor<bits, 8>();
++  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
++  constexpr int BK_padded = (BK + 16 / sizeof(T));
++  constexpr int BN_padded = (BN + 16 / sizeof(T));
++
++  using loader_w_t = QuantizedBlockLoader<
++      T,
++      transpose ? BN : BK,
++      transpose ? BK : BN,
++      transpose ? BK_padded : BN_padded,
++      transpose,
++      WM * WN * SIMD_SIZE,
++      group_size,
++      bits>;
++
++  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
++
++  // Compute the block
++  const int K_w = K * bytes_per_pack / pack_factor;
++  const int K_g = K / group_size;
++  const int N_w = N * bytes_per_pack / pack_factor;
++  const int N_g = N / group_size;
++  const int K_it = K / BK;
++  const size_t stride_w = transpose ? N * K_w : K * N_w;
++  const size_t stride_s = transpose ? N * K_g : K * N_g;
++  const int y_row = tile.x;
++  const int m_end = tile.y;
++  const int y_col = tid.x * BN;
++  const size_t y_row_long = size_t(y_row);
++  const size_t y_col_long = size_t(y_col);
++
++  // Prepare threadgroup bounds
++  const short tgp_bm = align_M ? BM : short(min(BM, m_end - y_row));
++  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
++
++  // Calculate the final tiles in the case that K is not aligned
++  const int k_remain = K - K_it * BK;
++  const short2 tile_w =
++      transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
++
++  // Move x and output to the correct block. With gather_x, row r of the
++  // product reads row x_rows[r] of x.
++  auto wl = (const device uint8_t*)w;
++  if (!gather_x) {
++    x += y_row_long * K;
++  }
++  y += y_row_long * N + y_col_long;
++  wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
++  scales += transpose ? y_col_long * K_g : y_col / group_size;
++  biases += transpose ? y_col_long * K_g : y_col / group_size;
++
++  constexpr short SM = BM / WM;
++  constexpr short SN = BN / WN;
++  constexpr short SK = 32;
++
++  constexpr short TM = SM / 16;
++  constexpr short TN = SN / 16;
++  constexpr short TK = SK / 16;
++
++  const short tm = SM * (simd_group_id / WN);
++  const short tn = SN * (simd_group_id % WN);
++
++  const short sgp_sm =
++      align_M ? SM : min(int(SM), max(0, (m_end - (y_row + tm))));
++  const short sgp_sn = align_N ? SN : min(int(SN), max(0, (N - (y_col + tn))));
++
++  const bool is_unaligned_sm = align_M ? false : (sgp_sm != SM);
++  const bool is_unaligned_bn = align_N ? false : (tgp_bn != BN);
++
++  constexpr short BR = transpose ? TN : TK;
++  constexpr short BC = transpose ? TK : TN;
++
++  using AccumType = float;
++
++  // Do as many matmuls as necessary
++  uint32_t index;
++  short offset;
++  uint32_t index_next = indices[y_row];
++  short offset_next = 0;
++  int n = 0;
++  while (n < tgp_bm) {
++    n++;
++    offset = offset_next;
++    index = index_next;
++    offset_next = tgp_bm;
++    for (; n < tgp_bm; n++) {
++      if (indices[y_row + n] != index) {
++        offset_next = n;
++        index_next = indices[y_row + n];
++        break;
++      }
++    }
++    threadgroup_barrier(mem_flags::mem_none);
++
++    // Prepare threadgroup mma operation
++    const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
++    const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
++    const bool sg_active = m_hi_lim > m_lo_lim;
++
++    NAXTile<AccumType, TM, TN> Dtile;
++    Dtile.clear();
++
++    const device T* xn = x + tm * K;
++
++    // With gather_x, the two rows of each A fragment that this thread loads.
++    // Rows past the tile repeat its last row; their results are not stored.
++    const device T* xr[TM][2];
++    if (gather_x) {
++      const short2 sc = BaseNAXFrag::get_coord();
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < TM; i++) {
++        STEEL_PRAGMA_UNROLL
++        for (short r = 0; r < 2; r++) {
++          const int row = min(y_row + tm + i * 16 + sc.y + r * 8, m_end - 1);
++          xr[i][r] = x + size_t(x_rows[row]) * K + sc.x;
++        }
++      }
++    }
++
++    // Prepare threadgroup loading operations
++    thread loader_w_t loader_w(
++        wl + index * stride_w,
++        scales + index * stride_s,
++        biases + index * stride_s,
++        transpose ? K : N,
++        Ws,
++        simd_group_id,
++        simd_lane_id);
++
++    dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
++      dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
++        for (int k = 0; k < K_it; k++) {
++          threadgroup_barrier(mem_flags::mem_threadgroup);
++          if constexpr (kAlignedN.value) {
++            loader_w.load_unsafe();
++          } else {
++            loader_w.load_safe(
++                transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
++          }
++
++          threadgroup_barrier(mem_flags::mem_threadgroup);
++
++          STEEL_PRAGMA_NO_UNROLL
++          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
++            if (sg_active) {
++              NAXTile<T, TM, TK> Atile;
++              NAXTile<T, BR, BC> Btile;
++
++              volatile int compiler_barrier;
++
++              if (gather_x) {
++                STEEL_PRAGMA_UNROLL
++                for (short i = 0; i < TM; i++) {
++                  STEEL_PRAGMA_UNROLL
++                  for (short tk = 0; tk < TK; tk++) {
++                    thread auto& fr = Atile.frag_at(i, tk);
++                    STEEL_PRAGMA_UNROLL
++                    for (short r = 0; r < 2; r++) {
++                      STEEL_PRAGMA_UNROLL
++                      for (short j = 0; j < 4; j++) {
++                        fr[r * 4 + j] = xr[i][r][kk1 + tk * 16 + j];
++                      }
++                    }
++                  }
++                }
++              } else if constexpr (kAlignedM.value) {
++                Atile.load(xn + kk1, K);
++              } else {
++                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
++              }
++
++              if constexpr (transpose) {
++                Btile.template load<T, BK_padded, 1>(
++                    Ws + tn * BK_padded + kk1);
++              } else {
++                Btile.template load<T, BN_padded, 1>(
++                    Ws + tn + kk1 * BN_padded);
++              }
++
++              tile_matmad_nax(
++                  Dtile,
++                  Atile,
++                  metal::bool_constant<false>{},
++                  Btile,
++                  metal::bool_constant<transpose>{});
++
++              (void)compiler_barrier;
++            }
++          }
++
++          xn += BK;
++          if (gather_x) {
++            STEEL_PRAGMA_UNROLL
++            for (short i = 0; i < TM; i++) {
++              xr[i][0] += BK;
++              xr[i][1] += BK;
++            }
++          }
++          loader_w.next();
++        }
++
++        if (!align_K) {
++          threadgroup_barrier(mem_flags::mem_threadgroup);
++          loader_w.load_safe(tile_w);
++          threadgroup_barrier(mem_flags::mem_threadgroup);
++
++          STEEL_PRAGMA_NO_UNROLL
++          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
++            if (sg_active) {
++              NAXTile<T, TM, TK> Atile;
++              NAXTile<T, BR, BC> Btile;
++
++              volatile int compiler_barrier;
++
++              const short psk = min(int(SK), max(0, (k_remain - kk1)));
++              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
++
++              if constexpr (transpose) {
++                Btile.template load<T, BK_padded, 1>(
++                    Ws + tn * BK_padded + kk1);
++              } else {
++                Btile.template load<T, BN_padded, 1>(
++                    Ws + tn + kk1 * BN_padded);
++              }
++
++              tile_matmad_nax(
++                  Dtile,
++                  Atile,
++                  metal::bool_constant<false>{},
++                  Btile,
++                  metal::bool_constant<transpose>{});
++
++              (void)compiler_barrier;
++            }
++          }
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        // Store results to device memory
++        if constexpr (kAlignedN.value) {
++          if (m_lo_lim == 0 && m_hi_lim == SM) {
++            Dtile.store(y + tm * N + tn, N);
++          } else {
++            Dtile.store_slice(
++                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
++          }
++        } else {
++          Dtile.store_slice(
++              y + tm * N + tn,
++              N,
++              short2(0, m_lo_lim),
++              short2(sgp_sn, m_hi_lim));
++        }
++      });
++    });
++  }
++}
++
++template <int BM>
++[[kernel]] void gather_rhs_tiles(
++    const device uint32_t* indices [[buffer(0)]],
++    device int2* tiles [[buffer(1)]],
++    const constant int& M [[buffer(2)]],
++    const constant int& max_tiles [[buffer(3)]],
++    uint tid [[thread_position_in_threadgroup]],
++    uint tsize [[threads_per_threadgroup]],
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  threadgroup int sg_sums[32];
++  threadgroup int total;
++
++  const int per = (M + int(tsize) - 1) / int(tsize);
++  const int r0 = min(M, int(tid) * per);
++  const int r1 = min(M, r0 + per);
++
++  auto segment_end = [&](int i) {
++    int j = i + 1;
++    while (j < M && indices[j] == indices[i]) {
++      j++;
++    }
++    return j;
++  };
++
++  int count = 0;
++  for (int i = r0; i < r1; i++) {
++    if (i == 0 || indices[i] != indices[i - 1]) {
++      count += (segment_end(i) - i + BM - 1) / BM;
++    }
++  }
++
++  // Exclusive prefix sum of the counts over the threadgroup
++  if (simd_group_id == 0) {
++    sg_sums[simd_lane_id] = 0;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  int incl = simd_prefix_inclusive_sum(count);
++  if (simd_lane_id == 31) {
++    sg_sums[simd_group_id] = incl;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (simd_group_id == 0) {
++    int v = sg_sums[simd_lane_id];
++    int v_incl = simd_prefix_inclusive_sum(v);
++    sg_sums[simd_lane_id] = v_incl - v;
++    if (simd_lane_id == 31) {
++      total = v_incl;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++
++  int offset = sg_sums[simd_group_id] + incl - count;
++  for (int i = r0; i < r1; i++) {
++    if (i == 0 || indices[i] != indices[i - 1]) {
++      int end = segment_end(i);
++      for (int s = i; s < end; s += BM) {
++        tiles[offset++] = int2(s, min(s + BM, end));
++      }
++    }
++  }
++  for (int t = total + int(tid); t < max_tiles; t += int(tsize)) {
++    tiles[t] = int2(0, 0);
++  }
++}
+diff --git a/mlx/backend/metal/kernels/quantized_nax.metal b/mlx/backend/metal/kernels/quantized_nax.metal
+index 4d61232ea77822dd79808cdc14b8907000bf9a7c..358813659327051d03e8b5608018a256f1fed7c8 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.metal
++++ b/mlx/backend/metal/kernels/quantized_nax.metal
+@@ -111,3 +111,10 @@
+   instantiate_quantized_groups(8)
+ 
+ instantiate_quantized_all() // clang-format on
++
++// Qualified three-bit routed geometry.
++instantiate_gather_qmm_rhs(qualified_affine_gather_qmm_rhs_nax, qualified_affine_gather_qmm_rhs_nax_nt, float16_t, 128, 3, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(qualified_affine_gather_qmm_rhs_nax, qualified_affine_gather_qmm_rhs_nax_nt, float16_t, 128, 3, 64, 64, 128, 4, 1, true)
++instantiate_gather_qmm_rhs(qualified_affine_gather_qmm_rhs_nax, qualified_affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 3, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(qualified_affine_gather_qmm_rhs_nax, qualified_affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 3, 64, 64, 128, 4, 1, true)
++instantiate_kernel("gather_rhs_tiles_bm_64", gather_rhs_tiles, 64);
+diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kernels.cpp
+index 93f8cf311fceef7a206ad65cbf18580fbce1db42..fb5d43330722aabdd43d2fef568052298b8a3ae8 100644
+--- a/mlx/backend/metal/nojit_kernels.cpp
++++ b/mlx/backend/metal/nojit_kernels.cpp
+@@ -476,6 +476,13 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
+   return d.get_kernel(kernel_name);
+ }
+ 
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    int) {
++  return d.get_kernel(kernel_name);
++}
++
+ MTL::ComputePipelineState* get_gather_qmm_nax_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 052dd761c48ff21f750ea6ff2203202a0be1f25e..8bb4b53d18e34af1c41e2a1d8046c9d73d8b5b73 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1528,6 +1528,198 @@ void gather_qvm(
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+ }
+ 
++void qualified_gather_qmm_rhs_nax(
++    const array& x_,
++    const array& w_,
++    const array& scales_,
++    const std::optional<array>& biases_,
++    const std::optional<array>& global_scale,
++    const array& indices_,
++    array& out,
++    bool transpose,
++    int group_size,
++    int bits,
++    int M,
++    int N,
++    int K,
++    metal::Device& d,
++    const Stream& s,
++    const std::string mode,
++    const std::optional<array>& x_rows_ = std::nullopt) {
++  // Start by normalizing the indices
++  array indices = ensure_row_contiguous(indices_, d, s);
++
++  // Broadcast x with indices. If we are here that means lhs_indices were not
++  // provided so the lhs_indices are implied to be the shape of x broadcasted
++  // with rhs_indices. We need only broadcast x and copy it as if applying the
++  // lhs_indices.
++  auto broadcast_with_indices = [&d, &s, &indices](const array& x) {
++    if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
++      return ensure_row_contiguous(x, d, s);
++    }
++
++    auto x_shape = indices.shape();
++    x_shape.push_back(x.shape(-2));
++    x_shape.push_back(x.shape(-1));
++    array new_x(std::move(x_shape), x.dtype(), nullptr, {});
++    broadcast(x, new_x);
++    return ensure_row_contiguous(new_x, d, s);
++  };
++
++  // Normalize the input arrays. With x_rows, the kernel reads row x_rows[r]
++  // of x for row r of the product, so x is not broadcast.
++  const bool gather_x = x_rows_.has_value();
++  array x = gather_x ? ensure_row_contiguous(x_, d, s) : broadcast_with_indices(x_);
++  array w = ensure_row_contiguous(w_, d, s);
++  array scales = ensure_row_contiguous(scales_, d, s);
++  std::optional<array> biases;
++  if (biases_) {
++    biases = ensure_row_contiguous(*biases_, d, s);
++  }
++  std::optional<array> gs;
++  if (global_scale) {
++    gs = ensure_row_contiguous(*global_scale, d, s);
++  }
++
++  // Use smaller bm for many experts and few tokens.
++  int E = w.size() / w.shape(-1) / w.shape(-2);
++  int bm = (M / E < 64) ? 32 : 64;
++  int bn = 64, bk = 64;
++  int wm = 2, wn = 2;
++
++  // Expert-aligned row tiles: each threadgroup multiplies rows of one expert
++  // only, so no weight tile is dequantized for a partial expert segment. Four
++  // simdgroups of 16 rows keep the partial last tile of an expert cheap.
++  // A K block of 128 halves the threadgroup barriers per K.
++  const bool use_tiles = transpose &&
++      (mode != "affine" || ((bits == 2 || bits == 3) && group_size == 128));
++  if (use_tiles) {
++    bm = 64;
++    bk = (K % 128 == 0) ? 128 : 64;
++    wm = 4;
++    wn = 1;
++  }
++  const int max_tiles = (M + bm - 1) / bm + std::min(E, M);
++
++  const bool align_M = !use_tiles && (M % bm) == 0;
++  const bool align_N = (N % bn) == 0;
++  const bool align_K = (K % bk) == 0;
++
++  // Make the kernel name
++  std::string kname;
++  kname.reserve(64);
++  std::string type_string = get_type_string(x.dtype());
++  concatenate(
++      kname,
++      "qualified_" + mode +
++          (transpose ? "_gather_qmm_rhs_nax_nt_" : "_gather_qmm_rhs_nax_nn_"),
++      type_string,
++      "_gs_",
++      group_size,
++      "_b_",
++      bits,
++      "_bm_",
++      bm,
++      "_bn_",
++      bn,
++      "_bk_",
++      bk,
++      "_wm_",
++      wm,
++      "_wn_",
++      wn,
++      global_scale ? "_hgs" : "");
++
++  metal::MTLFCList func_consts = {
++      {&align_M, MTL::DataType::DataTypeBool, 200},
++      {&align_N, MTL::DataType::DataTypeBool, 201},
++      {&align_K, MTL::DataType::DataTypeBool, 202},
++      {&use_tiles, MTL::DataType::DataTypeBool, 203},
++      {&gather_x, MTL::DataType::DataTypeBool, 204},
++  };
++
++  // And the kernel hash that includes the function constants
++  std::string hash_name;
++  hash_name.reserve(128);
++  concatenate(
++      hash_name,
++      kname,
++      "_align_M_",
++      align_M ? 't' : 'n',
++      "_align_N_",
++      align_N ? 't' : 'n',
++      "_align_K_",
++      align_K ? 't' : 'n',
++      "_tiles_",
++      use_tiles ? 't' : 'n',
++      "_gather_x_",
++      gather_x ? 't' : 'n');
++
++  auto& compute_encoder = metal::get_command_encoder(s);
++
++  // Build the expert-aligned tiles from the sorted indices
++  array tiles({max_tiles, 2}, int32, nullptr, {});
++  if (use_tiles) {
++    tiles.set_data(allocator::malloc(tiles.nbytes()));
++    compute_encoder.add_temporary(tiles);
++    auto tiles_kernel = get_gather_rhs_tiles_kernel(
++        d, "gather_rhs_tiles_bm_" + std::to_string(bm), bm);
++    compute_encoder.set_compute_pipeline_state(tiles_kernel);
++    compute_encoder.set_input_array(indices, 0);
++    compute_encoder.set_output_array(tiles, 1);
++    compute_encoder.set_bytes(M, 2);
++    compute_encoder.set_bytes(max_tiles, 3);
++    compute_encoder.dispatch_threadgroups(
++        MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
++  }
++
++  // Get and set the kernel
++  auto kernel = get_gather_qmm_nax_kernel(
++      d,
++      kname,
++      hash_name,
++      func_consts,
++      x,
++      group_size,
++      bits,
++      mode,
++      bm,
++      bn,
++      bk,
++      wm,
++      wn,
++      transpose,
++      global_scale.has_value());
++  compute_encoder.set_compute_pipeline_state(kernel);
++
++  MTL::Size group_dims(32, wn, wm);
++  MTL::Size grid_dims(
++      (N + bn - 1) / bn, use_tiles ? max_tiles : (M + bm - 1) / bm, 1);
++
++  compute_encoder.set_input_array(x, 0);
++  compute_encoder.set_input_array(w, 1);
++  compute_encoder.set_input_array(scales, 2);
++  if (biases) {
++    compute_encoder.set_input_array(*biases, 3);
++  } else if (gs) {
++    compute_encoder.set_input_array(*gs, 3);
++  }
++  int c = 4;
++  compute_encoder.set_input_array(indices, c++);
++  compute_encoder.set_output_array(out, c++);
++  compute_encoder.set_bytes(M, c++);
++  compute_encoder.set_bytes(N, c++);
++  compute_encoder.set_bytes(K, c++);
++  if (use_tiles) {
++    compute_encoder.set_input_array(tiles, c++);
++  }
++  if (gather_x) {
++    compute_encoder.set_input_array(ensure_row_contiguous(*x_rows_, d, s), 10);
++  }
++
++  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
++}
++
+ void gather_qmm_rhs_nax(
+     const array& x_,
+     const array& w_,
+@@ -2005,11 +2197,22 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+ 
++  // Keep the qualified G128 gathered-row path without changing other modes.
++  if (M == 1 && B >= 16 && B / E >= 4 && right_sorted_ && transpose_ &&
++      metal::is_nax_available() && mode_ == QuantizationMode::Affine &&
++      bits_ == 3 && group_size_ == 128 && K % 64 == 0 && x.dtype() != float32) {
++    qualified_gather_qmm_rhs_nax(
++        x, w, scales, biases, global_scale, rhs_indices, out, transpose_,
++        group_size_, bits_, B, N, K, d, s, mode,
++        left_sorted_ ? std::optional<array>(lhs_indices) : std::nullopt);
++    return;
++  }
++
+   // We are walking x in order and w is also in order so we can batch up the
+   // matmuls and reuse reading x and w.
+   //
+   // TODO: Tune 16 and 4 here a bit better.
+-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
++  if (M == 1 && B >= 16 && right_sorted_ && !left_sorted_ && B / E >= 4) {
+     gather_qmm_rhs(
+         x,
+         w,
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 01ad2778f8222962e18778a3c1e7533912b943ae..2b927ceba5e4b167e3572d392cece99caac737e0 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -5815,14 +5815,16 @@ array gather_qmm(
+   return array(
+       std::move(out_shape),
+       out_type,
++      // With both indices and sorted_indices, both flags are set: the rhs
++      // indices are sorted and the lhs indices pick rows of x.
+       std::make_shared<GatherQMM>(
+           to_stream(s),
+           group_size,
+           bits,
+           qmode,
+           transpose,
+-          sorted_indices && !rhs_indices_,
+-          sorted_indices && !lhs_indices_),
++          sorted_indices && (!rhs_indices_ || lhs_indices_),
++          sorted_indices && (!lhs_indices_ || rhs_indices_)),
+       std::move(inputs));
+ }
+ 
+diff --git a/python/src/ops.cpp b/python/src/ops.cpp
+index 4d83c6293ca8f4b2f6fa81e59ad3bb07695b950a..e0d04da8b4fe6d7c8ef3188069262bfc0757425d 100644
+--- a/python/src/ops.cpp
++++ b/python/src/ops.cpp
+@@ -5019,7 +5019,8 @@ void init_ops(nb::module_& m) {
+               ``nvfp4`` quantization of ``w``. Only supported on the GPU.
+               Default: ``None``.
+             sorted_indices (bool, optional): May allow a faster implementation
+-              if the passed indices are sorted. Default: ``False``.
++              if the passed indices are sorted. If both indices are passed,
++              only ``rhs_indices`` needs to be sorted. Default: ``False``.
+ 
+         Returns:
+             array: The result of the multiplication of ``x`` with ``w``
+diff --git a/python/tests/test_quantized.py b/python/tests/test_quantized.py
+index 3c1bf0bbf86e48a628c9d0cf219b57ebfb4a921e..ed5a7db7a2e3fbc937c895250dc2219af35061df 100644
+--- a/python/tests/test_quantized.py
++++ b/python/tests/test_quantized.py
+@@ -2271,6 +2271,40 @@ class TestQuantized(mlx_tests.MLXTestCase):
+                     self.assertLess(float(max_error.item()), 5e-2)
+                     del y_q, max_error
+ 
++    def test_gather_qmm_sorted_uneven_experts(self):
++        # Sorted rows with uneven, sometimes empty or long, expert segments.
++        E, N, K = 64, 256, 512
++        mx.random.seed(0)
++        w = mx.random.normal((E, N, K)) / K**0.5
++        for mode in ("mxfp4", "mxfp8", "nvfp4"):
++            qw, s = mx.quantize(w, mode=mode)
++            w_hat = mx.dequantize(qw, s, mode=mode)
++            for name, M in (("few", 100), ("odd", 1000), ("skewed", 3000)):
++                with self.subTest(mode=mode, case=name):
++                    if name == "skewed":
++                        u = mx.random.uniform(shape=(M,)) ** 4
++                        idx = (u * E).astype(mx.uint32)
++                    else:
++                        idx = mx.random.randint(0, E, (M,)).astype(mx.uint32)
++                    idx = mx.sort(idx)
++                    x = (mx.random.normal((M, 1, K)) / K**0.5).astype(mx.bfloat16)
++                    y = mx.gather_qmm(
++                        x,
++                        qw,
++                        s,
++                        rhs_indices=idx,
++                        transpose=True,
++                        mode=mode,
++                        sorted_indices=True,
++                    )
++                    y_hat = mx.gather_mm(
++                        x.astype(mx.float32),
++                        w_hat.swapaxes(-1, -2),
++                        rhs_indices=idx,
++                        sorted_indices=True,
++                    )
++                    self.assertLess((y.astype(mx.float32) - y_hat).abs().max(), 2e-2)
++
+     @unittest.skipIf(mx.cuda.is_available(), "Not implemented for CUDA")
+     def test_gather_qmm_sorted_sliced_weight(self):
+         E, R, D, N = 8, 64, 256, 64
