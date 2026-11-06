@@ -80,3 +80,15 @@ def test_whole_phase_does_not_iterate_prompt_chunks(bounded_policy, monkeypatch)
     monkeypatch.setattr(cls, "prediction_components", counted)
     profile.estimate_whole_prefill_transient_bytes(8192, 1048576)
     assert calls == [(8192, 1048576), (8, 1048576)]
+
+
+@pytest.mark.parametrize("tail", [1, 8, 9, 128, 255, 256, 463, 512, 8192])
+def test_cached_tail_bound_retains_full_attention_context(bounded_policy, tail):
+    profile = bounded_policy.native
+    cached = 65536
+    context = cached + tail + 1  # The last token is the decode kickoff.
+    bound = profile.estimate_whole_prefill_transient_bytes(tail, context)
+    for width in {1, min(8, tail), tail}:
+        assert profile.prediction_components(width, cached + tail)["transient_bytes"] <= bound
+    if tail < 8192:
+        assert bound < profile.estimate_whole_prefill_transient_bytes(8192, context)

@@ -370,16 +370,17 @@ class ExactPrefixCache:
         if self._persistence:
             self._persistence.close(wait=wait)
 
-    def prepare(self, tokens, step=CHUNK, *, extra_keys=None,
-                extra_key_token_start=None, extra_key_ranges=None):
+    def _lookup_plan(self, tokens, step=CHUNK, *, extra_keys=None,
+                     extra_key_token_start=None, extra_key_ranges=None):
+        """Build the same token/image lookup keys without touching cache state."""
         # Leave the final prompt token for the ordinary generation kickoff.
         if not self.max_bytes or step != CHUNK or len(tokens) <= CHUNK:
-            return None, 0, None
+            return None
         try:
             identity = _request_identity(tokens, self.image_token_id, extra_keys,
                                          extra_key_token_start, extra_key_ranges)
         except (TypeError, ValueError):
-            return None, 0, None
+            return None
         packed = struct.pack("<%dI" % len(tokens), *tokens)
         packed_view = memoryview(packed)
         digest = hashlib.sha256(b"ds41-ced-8192-v1")
@@ -395,6 +396,43 @@ class ExactPrefixCache:
                 keyed.update(struct.pack("<Q", len(proof)))
                 keyed.update(proof)
             keys[end] = keyed.digest()
+        return Plan(packed, keys, 0, identities=identities)
+
+    def preview_cached_tokens(self, tokens, step=CHUNK, *, extra_keys=None,
+                              extra_key_token_start=None, extra_key_ranges=None) -> int:
+        """Hint at reusable tokens without restoring, waiting or changing LRU.
+
+        An SSD catalog hit is only a hint. The scheduler must reprice the
+        actual residual after prepare() and cache validation before execution.
+        """
+        try:
+            plan = self._lookup_plan(tokens, step, extra_keys=extra_keys,
+                                     extra_key_token_start=extra_key_token_start,
+                                     extra_key_ranges=extra_key_ranges)
+        except (TypeError, ValueError, OverflowError, struct.error):
+            return 0
+        if plan is None:
+            return 0
+        for end, key in reversed(list(plan.keys.items())):
+            entry = self.entries.get(key)
+            if entry is not None:
+                if (type(entry.size) is int and 0 < entry.size <= self.max_bytes
+                        and entry.tokens == plan.tokens[:end * 4]
+                        and entry.identity == plan.identities[end]):
+                    return end
+            elif (self._l2 is not None
+                  and self._l2.has_committed_checkpoint(key, end)):
+                return end
+        return 0
+
+    def prepare(self, tokens, step=CHUNK, *, extra_keys=None,
+                extra_key_token_start=None, extra_key_ranges=None):
+        plan = self._lookup_plan(tokens, step, extra_keys=extra_keys,
+                                 extra_key_token_start=extra_key_token_start,
+                                 extra_key_ranges=extra_key_ranges)
+        if plan is None:
+            return None, 0, None
+        packed, keys, identities = plan.tokens, plan.keys, plan.identities
         for end, key in reversed(list(keys.items())):
             entry = self.entries.get(key)
             from_l2 = entry is None
@@ -446,8 +484,9 @@ class ExactPrefixCache:
                     (time.perf_counter() - t0) * 1000,
                     self.bytes / 2**20,
                 )
-                return cache, end, Plan(packed, keys, end, identities=identities)
-        return None, 0, Plan(packed, keys, 0, identities=identities)
+                plan.next_position = end
+                return cache, end, plan
+        return None, 0, plan
 
     def record(self, plan, cache, start, count):
         if plan is None or not plan.valid:

@@ -56,11 +56,17 @@ class RequestMemoryEnvelope:
 
 
 def estimate_envelope(monitor, prompt_tokens, max_tokens, step_size, predict, *,
-                      decode_predict=None, step_tokens=5, caches=None, decoding=False):
+                      decode_predict=None, step_tokens=5, caches=None, decoding=False,
+                      remaining_prefill_tokens=None):
     # max_tokens is retained in this internal signature for compatibility only.
     context = max(1, int(prompt_tokens))
     span = max(1, int(step_tokens))
     query = max(1, min(int(step_size), max(1, context - 1)))
+    if remaining_prefill_tokens is not None:
+        # Only the compute workspace follows the uncached tail. Keep the full
+        # context for attention keys, KV/COW capacity and decode verification.
+        # The caller excludes the final prompt token (generation kickoff).
+        query = min(query, max(0, int(remaining_prefill_tokens)))
     profile = getattr(monitor, "_prefill_memory_profile", None)
     slots = getattr(profile, "allocation_slots", ())
     slots = slots if isinstance(slots, tuple) else ()
@@ -81,7 +87,7 @@ def estimate_envelope(monitor, prompt_tokens, max_tokens, step_size, predict, *,
         current_capacity, next_capacity, allocation_growth = layout
         resident = current_capacity + allocation_growth
         cap = current_capacity
-    prefill = 0 if decoding else math.ceil(predict(query, max(0, context - query)))
+    prefill = 0 if decoding or query == 0 else math.ceil(predict(query, max(0, context - query)))
     verify = math.ceil((decode_predict or predict)(span, context))
     if resident < 0 or prefill < 0 or verify < 0 or resident + prefill + verify == 0:
         raise ValueError("Request memory estimate is unavailable")

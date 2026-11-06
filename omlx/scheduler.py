@@ -13327,6 +13327,71 @@ class Scheduler:
             self._admin_snapshot = {**self._admin_snapshot,
                                     "memory_budget": self._memory_budget_snapshot()}
 
+    def _remaining_exact_prefill_tokens(self, request):
+        """Read a CED cache hint before admission, or the verified residual after it.
+
+        A preview never restores tensors or proves a hit. The scheduler must
+        reprice after prepare/validation and before any model work. Requeues
+        and sparse prefill retain their existing conservative accounting.
+        """
+        if (not getattr(self, "_prefill_whole_reservation", False)
+                or self.block_aware_cache is not None
+                or _request_count(request, "requeued_output_tokens")
+                or getattr(request, "_specprefill_enabled", False)
+                or request.specprefill_indices is not None):
+            return None
+        tokens = request.prompt_token_ids
+        if not tokens or len(tokens) != request.num_prompt_tokens:
+            return None
+        exact = _exact_prefix_manager(getattr(self, "model", None))
+        vision_keys = request.vlm_extra_keys_for_cache
+        if exact is None or (request.vlm_inputs_embeds is not None and not vision_keys):
+            return None
+        if request.request_id in self._prefix_cache_prepared:
+            # A failed/shorter restore must not reuse the optimistic hint on
+            # retries. Count only the cache that survived final validation.
+            cached = request.cached_tokens
+            remaining = request.remaining_tokens
+            if (type(cached) is not int or not 0 <= cached < len(tokens)
+                    or (cached and request.prompt_cache is None)
+                    or remaining is None or len(remaining) != len(tokens) - cached):
+                return None
+            return max(0, len(remaining) - 1)
+        preview = getattr(exact, "preview_cached_tokens", None)
+        if not callable(preview):
+            return None
+        identity_kwargs = {}
+        if vision_keys is not None:
+            identity_kwargs = {
+                "extra_keys": vision_keys,
+                "extra_key_token_start": request.vlm_extra_key_token_start_for_cache,
+                "extra_key_ranges": request.vlm_extra_key_ranges_for_cache,
+            }
+        cached = preview(tokens, self.config.prefill_step_size, **identity_kwargs)
+        if (type(cached) is not int or not 0 < cached < len(tokens)
+                or cached % self.config.prefill_step_size):
+            return None
+        return len(tokens) - cached - 1
+
+    def _reconcile_prefix_workspace_budget(self, request) -> bool:
+        """Verify a hinted workspace against restored, validated cache state."""
+        if (not getattr(self, "_pipeline_memory_budget_enabled", False)
+                or not getattr(self, "_prefill_whole_reservation", False)):
+            return True
+        budget = self._request_memory_budget
+        previous = budget.reservations.get(request.request_id)
+        if previous is None:
+            return True
+        envelope = self._pipeline_progress_envelope(request)
+        if envelope == previous:
+            return True
+        self._refresh_pipeline_shared_budget()
+        self._refresh_decode_progress_budgets()
+        return budget.try_resize(
+            request.request_id, envelope, self._current_usage_bytes(),
+            min(self._admission_limit_bytes(), self._prefill_peak_target()),
+        )
+
     def _pipeline_progress_envelope(self, request, *, decoding=False, caches=None,
                                     prefill_step_size=None):
         # A prefill allocator debt is not a decode workspace. The V4.1
@@ -13385,11 +13450,14 @@ class Scheduler:
                 # switch the workspace planner from decode to prefill.
                 buffered = len(queue)
         progress = len(request.output_token_ids) if decoding else 0
+        remaining_prefill = (self._remaining_exact_prefill_tokens(request)
+                             if bounded and not decoding else None)
         return estimate_envelope(
             self.memory_monitor, request.num_prompt_tokens + folded + progress + buffered, 0,
             self.config.prefill_step_size if prefill_step_size is None else prefill_step_size,
             prefill_predict,
             decode_predict=decode_predict, step_tokens=span, caches=caches, decoding=decoding,
+            remaining_prefill_tokens=remaining_prefill,
         )
 
     def _decode_row_caches(self, request_id):
@@ -14341,6 +14409,20 @@ class Scheduler:
                 tokens_to_process = request.prompt_token_ids
                 # Indices were scored against the rejected cache's cached_tokens.
                 request.specprefill_indices = None
+
+            if not self._reconcile_prefix_workspace_budget(request):
+                # Metadata can outlive an evicted/corrupt checkpoint. Never
+                # execute its cold fallback under a short-tail reservation.
+                # Keep the prepared result so the next admission uses actual
+                # residual tokens and retains the normal no-progress timeout.
+                self.waiting.appendleft(request)
+                self._request_memory_budget.release(request.request_id)
+                request.memory_wait_reason = "context_budget"
+                if not (self.running or self.prefilling or self._pending_async_removes):
+                    stalled = self._memory_admission_stall_output("context_budget")
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
+                break
 
             if (
                 self._decode_fairness

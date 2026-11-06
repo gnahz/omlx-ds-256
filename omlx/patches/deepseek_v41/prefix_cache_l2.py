@@ -353,6 +353,30 @@ class ExactPrefixL2:
                 self.manager._protected_keys.discard(key)
             self._staging = False
 
+    def has_committed_checkpoint(self, key, token_count):
+        """Read only a published catalog row; never wait for or load a file."""
+        if (self._closed or not self.max_bytes or type(token_count) is not int
+                or not 8192 <= token_count <= MAX_CHECKPOINT_BYTES // 4):
+            return False
+        name = key.hex()
+        # A writer holds this lock while publishing and syncing the index.
+        # A busy catalog is an unknown hint, never a reason to wait for I/O.
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            row = self.entries.get(name)
+            if not isinstance(row, dict):
+                return False
+            size, tokens = row.get("size"), row.get("tokens")
+            file_bytes = row.get("file_bytes")
+            return (row.get("key") == name
+                    and type(tokens) is int and tokens == token_count
+                    and type(size) is int
+                    and 0 < size <= min(MAX_CHECKPOINT_BYTES, self.manager.max_bytes)
+                    and type(file_bytes) is int and file_bytes > 0)
+        finally:
+            self._lock.release()
+
     def has_checkpoint(self, key, *, count_miss=False):
         """Check the catalog or a matching pending write without reading the disk."""
         if self._closed or not self.max_bytes:
