@@ -4,7 +4,7 @@
 
 The fork starts at official oMLX v0.7.3, commit `9de79bc39a01c1f3fec1e849903aaf0dd5478d7a`. The import covers all 200 modified or added source files in the local 0.7.3 customization set, including scheduler/backend work, native kernels, frontend templates, locale updates, and regression tests. The separate deployment helpers and the nine-file MLX patch are also included.
 
-[`source-manifest.json`](source-manifest.json) records the original imported file hashes and the final portable file hashes. The portability changes replace machine-specific test paths, provide a checked-in architecture-only fixture, make external tokenizer tests explicitly optional, use loopback defaults for optional remote-encoder code, and update an obsolete cache test fixture to the current metadata format. Runtime numerical behavior and memory ceilings are preserved. The dependency declaration comment now explains why the stock same-version MLX wheel is insufficient.
+[`source-manifest.json`](source-manifest.json) records source and portable file hashes for that import, with the three draft-batching entries refreshed or added as described below. The portability changes replace machine-specific test paths, provide a checked-in architecture-only fixture, make external tokenizer tests explicitly optional, use loopback defaults for optional remote-encoder code, and update an obsolete cache test fixture to the current metadata format. Runtime numerical behavior and memory ceilings are preserved. The dependency declaration comment now explains why the stock same-version MLX wheel is insufficient.
 
 Checks performed on the independent checkout:
 
@@ -16,6 +16,23 @@ Checks performed on the independent checkout:
 - The pinned Hugging Face download preview succeeded without downloading weights. All 250 tensor LFS hashes agree with the published SHA256SUMS. Sizes and header hashes of the local 1017 checkpoint/overlay match the public metadata; only 252,741 header bytes were read for that comparison.
 
 The portable bootstrap/native build and a fresh model download/load have **not** been executed in this packaging pass. Build-script validation does not establish native ABI compatibility on another machine. No production API endpoint, service lifecycle, or model inference was used for these checks.
+
+## Draft-batching source sync (2026-11-16)
+
+This update imports the source runtime's bounded ordinary-DSpark draft batching, including greedy and restricted temperature-one admission, request-local sampling/cache ownership, and singleton fallback. The portable template enables `DS41_DRAFT_BATCH=1` and reports its actual state and counters. It preserves adaptive MTP depth four, the existing verification/projection paths, and all memory ceilings. See [draft-batching.md](draft-batching.md) for eligibility and configuration migration.
+
+The manifest refreshes only `omlx/patches/deepseek_v41/dspark.py` and `omlx/patches/mlx_lm_mtp/fused_batch.py`, and adds `omlx/patches/deepseek_v41/candidate_draft.py`. These three files match the source runtime byte for byte. The manifest now contains 201 entries: 191 byte-identical imports and the same 10 portability adaptations. Other entries retain their historical import hashes; this manifest is not a new snapshot of every file in the current runtime. Deployment changes and the two newly added CPU test files are maintained separately from that historical import set.
+
+For this source sync, **85 CPU tests passed**: 30 core draft-batching tests, 12 deployment draft-batching tests, and 43 existing deployment/configuration tests. The new files are `tests/test_deepseek_v41_candidate_draft_cpu.py` and `deploy/deepseek/tests/test_draft_batch_cpu.py`. The checks use stubs and source/configuration inspection; they do not import MLX or load weights. The command was:
+
+```sh
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 \
+  .venv-dev/bin/python -B -m pytest --noconftest -p no:cacheprovider -o addopts='' \
+  tests/test_deepseek_v41_candidate_draft_cpu.py \
+  deploy/deepseek/tests tests/deployment/test_portable_lifecycle.py -q
+```
+
+No inference, native build, portable live startup, or service/API operation was performed for this source sync. The existing November 16 source-runtime A/B results are documented separately in [draft-batching.md](draft-batching.md#prior-source-runtime-ab-evidence-2026-11-16). They cover six cells, 48 timed waves and 112 timed requests with warm 8K prefixes and 1,024 output tokens, and observed zero new swap I/O and zero peak compressor physical growth above baseline. They are prior source-runtime evidence, not a fresh portable-install qualification or a statistically established speedup.
 
 ## Reproduce CPU checks
 
@@ -34,6 +51,7 @@ Use `--noconftest` because the full upstream test configuration imports MLX. The
   tests/test_deepseek_v41_aligned_io_cpu.py \
   tests/test_deepseek_v41_exact_cache_io_cpu.py \
   tests/test_deepseek_v41_exact_verify_cpu.py \
+  tests/test_deepseek_v41_candidate_draft_cpu.py \
   tests/test_deepseek_v41_native_gate_up_cpu.py \
   tests/test_nax_hardware_cpu.py \
   tests/test_scheduler_prefill_peak_target_cpu.py \

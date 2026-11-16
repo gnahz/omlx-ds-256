@@ -341,6 +341,43 @@ def proposal_forward(model, input_ids, cache, draft_length=None, cost_policy=Fal
 # Batched drafting for og_fused pairs: one DSpark decoder pass over several requests' blocks
 # (DS41_OG_DRAFT_BATCH=0 = one pass per request). Every request gets its own pass's bits.
 DRAFT_BATCH = os.environ.get("DS41_OG_DRAFT_BATCH", "1") == "1"
+# Ordinary DSpark draft bodies share bounded rows only when explicitly enabled.
+# Keep the validated internal flag name; the service fixes this at startup.
+CANDIDATE_DRAFT_BATCH_ENABLED = os.environ.get("DS41_DRAFT_BATCH", "0") == "1"
+CANDIDATE_DIAGNOSTICS_ENABLED = False
+
+
+def candidate_draft_stats(reset=False):
+    from .candidate_draft import stats
+    return stats(reset=reset)
+
+
+def candidate_batch_reason(model, widths):
+    """An explicit refusal reason; eligibility changes no cache or model state."""
+    if not CANDIDATE_DRAFT_BATCH_ENABLED:
+        return "disabled"
+    if len(widths) < 2:
+        return "singleton"
+    if len(set(widths)) != 1 or not 2 <= widths[0] <= 4:
+        return "width"
+    if sum(widths) > _MAX_BATCH_ROWS:
+        return "workspace"
+    if mx.default_device() != mx.gpu:
+        return "device"
+    from .quantization import QuantizedProjection
+    head = model.head
+    if not (isinstance(head, QuantizedProjection) and head.mode == "affine"
+            and head.bits == 8 and head.group_size == 64
+            and not head.quantize_input):
+        return "head_format"
+    if not all(
+        all(isinstance(p, QuantizedProjection) and p.quantize_input
+            for p in (stage.attn.wq_a, stage.attn.wkv, stage.attn.wq_b, stage.attn.wo_b))
+        and stage.attn.wo_a.weight.dtype == mx.bfloat16
+        for stage in model.mtp
+    ):
+        return "stage_format"
+    return None
 
 
 def _stages_ok(model):
@@ -417,7 +454,7 @@ def _stage_batch(stage, hs, pres, bounds, caches):
     return hs, [fp for fp, _, _ in ffn]
 
 
-def proposal_forward_batch(model, anchors, caches, width, cost_policy=None):
+def proposal_forward_batch(model, anchors, caches, width, cost_policy=None, *, preserve_head_shapes=False):
     """proposal_forward for several requests of one width; returns each request's draft logits.
 
     cost_policy: per request, as proposal_forward's (see batch_logits).
@@ -444,7 +481,12 @@ def proposal_forward_batch(model, anchors, caches, width, cost_policy=None):
         if DRAFT_ASYNC and index + 1 < len(model.mtp):
             mx.async_eval(hs, pres)
     final = model.mtp[-1]
-    return batch_logits(model, [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], width, cost_policy)
+    normed = [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)]
+    if preserve_head_shapes:
+        # Packed affine8/G64 heads have row-count-sensitive reduction choices.
+        # Preserve each original proposal_forward's (1, width, hidden) call.
+        return [draft_logits(model, x, policy) for x, policy in zip(normed, cost_policy)]
+    return batch_logits(model, normed, width, cost_policy)
 
 
 def batch_logits(model, xs, width, cost_policy):

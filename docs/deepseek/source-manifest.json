@@ -240,6 +240,11 @@
       "portable_sha256": "7c81c8d7653bc9cc208c9ab620af727fc5effe00320cd874555c4a95a1591072"
     },
     {
+      "path": "omlx/patches/deepseek_v41/candidate_draft.py",
+      "source_sha256": "b423c772f2bd44ae33f5b322dd88c40578b4b96be1f09c7631a6296b84e08d0b",
+      "portable_sha256": "b423c772f2bd44ae33f5b322dd88c40578b4b96be1f09c7631a6296b84e08d0b"
+    },
+    {
       "path": "omlx/patches/deepseek_v41/config.py",
       "source_sha256": "cf5fc5355f780be2e588a349c5f2f948a8d9d5ea92fb71247864a169501c9ed1",
       "portable_sha256": "cf5fc5355f780be2e588a349c5f2f948a8d9d5ea92fb71247864a169501c9ed1"
@@ -261,8 +266,8 @@
     },
     {
       "path": "omlx/patches/deepseek_v41/dspark.py",
-      "source_sha256": "94913ec74b9e0bc296f9591075974e4d5f1dcf2563bfcf9d4dba5697cd179d5f",
-      "portable_sha256": "94913ec74b9e0bc296f9591075974e4d5f1dcf2563bfcf9d4dba5697cd179d5f"
+      "source_sha256": "6e82e62204dc7cd017eefcbd99a8f9fe95d60a5261f4dafc7ee5fd7f60ade3fc",
+      "portable_sha256": "6e82e62204dc7cd017eefcbd99a8f9fe95d60a5261f4dafc7ee5fd7f60ade3fc"
     },
     {
       "path": "omlx/patches/deepseek_v41/dspark_wire.py",
@@ -550,8 +555,8 @@
     },
     {
       "path": "omlx/patches/mlx_lm_mtp/fused_batch.py",
-      "source_sha256": "e0b9f7ab4936659b719d61444e5888ecaf0bef2657f2b290fe1001ad45a07677",
-      "portable_sha256": "e0b9f7ab4936659b719d61444e5888ecaf0bef2657f2b290fe1001ad45a07677"
+      "source_sha256": "81923cbcc7669e8066d448774bb2954f9804292a9ee5cb8568f1ab5cd9ba976d",
+      "portable_sha256": "81923cbcc7669e8066d448774bb2954f9804292a9ee5cb8568f1ab5cd9ba976d"
     },
     {
       "path": "omlx/prefill_progress.py",
@@ -1016,5 +1021,5 @@
     }
   ],
   "portable_adaptation_count": 10,
-  "byte_identical_import_count": 190
+  "byte_identical_import_count": 191
 }

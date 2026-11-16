@@ -140,6 +140,34 @@ def count_runtime_call(module, name, label, *, stats, lock):
     setattr(module, name, wrapped)
 
 
+def draft_runtime_actual(dspark, native_metadata):
+    """Snapshot Python flags/counters only; never import or evaluate experiment code."""
+    verify = sys.modules.get("omlx.patches.deepseek_v41.batched_verify")
+    attention = sys.modules.get("omlx.patches.deepseek_v41.attention_service")
+    attention_controller = getattr(attention, "_installed", None)
+    grouped_controller = getattr(native_metadata.compact_expert,
+                                 "_concurrency_grouped_metadata_controller", None)
+    shim_names = ("experiment", "grouped_metadata", "attention_candidate",
+                  "omlx.patches.deepseek_v41.attention_service",
+                  "omlx.patches.deepseek_v41.attention_group_kernel")
+    return {
+        "draft_batch": {
+            "enabled": bool(dspark.CANDIDATE_DRAFT_BATCH_ENABLED),
+            "diagnostics_enabled": bool(dspark.CANDIDATE_DIAGNOSTICS_ENABLED),
+            "max_rows": dspark._MAX_BATCH_ROWS,
+            "stats": dspark.candidate_draft_stats(),
+        },
+        "experiment_controls": {
+            "attention": bool(getattr(verify, "CANDIDATE_ATTENTION_ENABLED", False)
+                              or getattr(attention_controller, "enabled", False)),
+            "grouped": bool(getattr(grouped_controller, "enabled", False)),
+            "batched_verify": os.environ.get("DS41_BATCH_VERIFY", "1") != "0",
+            "batch_projections": os.environ.get("DS41_BATCH_PROJECTIONS", "1") != "0",
+            "loaded_shims": [name for name in shim_names if name in sys.modules],
+        },
+    }
+
+
 def runtime_actual(server, model_id):
     """Read the loaded engine's policy and module switches without evaluating weights."""
     from omlx.patches.deepseek_v41 import dspark, growth, native_metadata, native_metadata_prefill, storage
@@ -148,6 +176,7 @@ def runtime_actual(server, model_id):
               "native_metadata_prefill": bool(native_metadata_prefill.ENABLED),
               "growth": bool(growth.ENABLED), "pingpong": bool(growth.PINGPONG),
               "engram_storage": storage.runtime_status()}
+    actual.update(draft_runtime_actual(dspark, native_metadata))
     from omlx.custom_kernels.attention import fast as attention_fast
     actual["native_single_decode_capability"] = attention_fast.has_symbol("packed_sparse_attention_single_decode")
     from omlx.patches.deepseek_v41 import language, kernels, hc_fuse, attn_fusions, attn_in
@@ -303,6 +332,8 @@ def serve(profile, host, port, *, qualification=False, cold_prefix_baseline=Fals
 
     if not (dspark.DRAFT_ASYNC and native_metadata_prefill.ENABLED and growth.ENABLED):
         raise RuntimeError("Required migrated DeepSeek optimizations failed to activate")
+    if bool(dspark.CANDIDATE_DRAFT_BATCH_ENABLED) != bool(profile["effective_settings"].get("dspark_draft_batch", False)):
+        raise RuntimeError("DSpark draft batching differs from the declared service profile")
     memory_policy._PREFILL_HEADROOM_SAFETY["custom"] = .995
     memory_policy._PREFILL_ABORT_MARGIN["custom"] = .995
     original_init = server.init_server

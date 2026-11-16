@@ -36,7 +36,8 @@
     "prefill_peak_target_gib": 238,
     "prefill_min_chunk_tokens": 256,
     "prefill_preferred_chunk_tokens": 512,
-    "prefill_whole_reservation": true
+    "prefill_whole_reservation": true,
+    "dspark_draft_batch": true
   },
   "environment": {
     "DS41_NATIVE_DECODE": "1",
@@ -89,7 +90,8 @@
     "OMLX_PREFILL_MIN_CHUNK_TOKENS": "256",
     "OMLX_PREFILL_PREFERRED_CHUNK_TOKENS": "512",
     "OMLX_PREFILL_WHOLE_RESERVATION": "1",
-    "DS41_EXACT_PREFIX_CHECKPOINT_POLICY": "fibonacci_tail"
+    "DS41_EXACT_PREFIX_CHECKPOINT_POLICY": "fibonacci_tail",
+    "DS41_DRAFT_BATCH": "1"
   },
   "model_settings": {
     "version": 1,

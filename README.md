@@ -9,6 +9,7 @@ This fork combines the official [oMLX v0.7.3 release](https://github.com/jundot/
 - DeepSeek V4.1 1017 text and vision support, LSQ3/G128 routed experts, MXFP8 backbone projections, quantized embeddings/head, Engram SSD I/O, and MTP drafting.
 - Lossless dictionary compression of expert scale/bias metadata, saving about **7.90 GiB of resident memory** without changing quantization codes. Published metadata is prepared locally; weights are not requantized.
 - Custom packed sparse attention, bounded native prefill workspace, cache growth, projection and decode paths, plus the pinned custom MLX Q3/G128 gather patch.
+- Bounded cross-request DSpark draft batching for greedy sampling or the supported temperature-one sampler. The portable profile enables it; actual sharing depends on request and model eligibility. See [draft batching](docs/deepseek/draft-batching.md) for the gates, counters, and prior A/B evidence.
 - Exact CED prefix caching with image identity, Fibonacci checkpoints, RAM and SSD L2 accounting, and cache controls.
 - Whole-prefill memory reservations, queue admission, physical-memory/load guards, and process-footprint limits.
 - The custom Active Models dashboard: live request phases, recent output rates, queue positions, memory reservations, pending prefill requirements, and exact-cache statistics. The migrated locale changes are included.
@@ -89,6 +90,8 @@ python deploy/deepseek/prepare_metadata.py \
 Preparation checks the verified download and the published metadata proof, reads bounded safetensors headers, and creates hardlinks for the 120 encoded metadata files. `METADATA_DIR` must be a **new directory outside the checkpoint on the same filesystem**. The downloaded checkpoint bytes are preserved, and no second overlay payload is copied. Preparation adds the local file identities needed by the runtime.
 
 Configuration creates a private API key at `$OMLX_DS_STATE/api-key`, private settings, a model registry entry named `deepseek-v41-lsq`, and separate cache directories. The default endpoint is **127.0.0.1:8080**. To select another address or port, add `--host` and `--port` to `configure` before starting.
+
+**Existing portable installations:** the draft-batching update changes the checked deployment policy. `git pull` does not update an existing state profile or enable the feature in a running process. Startup compares the complete `effective_settings` and `environment` with the current template and refuses an old profile. In your own maintenance window, stop this portable service, rerun `configure` with the same state directory, original model/proof paths, and original `--host`/`--port`, then start it. See the [upgrade procedure](docs/deepseek/draft-batching.md#upgrading-an-existing-portable-installation). This applies to this repository's portable installation; it does not reconfigure a separate source-runtime deployment.
 
 ## 4. Start, stop, and restart
 

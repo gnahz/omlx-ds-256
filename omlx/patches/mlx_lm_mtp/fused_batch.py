@@ -91,10 +91,27 @@ def _advance_dspark(batch, batch_state, host):
     mx.eval([result[:2] for result in results])
     elapsed = (time.perf_counter() - started) * 1000 / len(rows)
     replacements = {}
+    from ..deepseek_v41 import dspark
+    candidate_enabled = dspark.CANDIDATE_DRAFT_BATCH_ENABLED
+    jobs, depths = [], []
+    if candidate_enabled:
+        from ..deepseek_v41 import candidate_draft
     for (index, row, state), result in zip(rows, results):
-        bg._run_verify_cycle_chain(row, state, verify_result=result, verify_ms=elapsed)
+        if candidate_enabled and candidate_draft.can_defer(row, state, bg):
+            previous = len(jobs)
+            depth = state.controller.cur if state.controller is not None else None
+            bg._run_verify_cycle_chain(
+                row, state, verify_result=result, verify_ms=elapsed, draft_jobs=jobs
+            )
+            if len(jobs) != previous + 1:
+                raise RuntimeError("A deferred DSpark cycle must retain exactly one draft job")
+            depths.append(depth)
+        else:
+            bg._run_verify_cycle_chain(row, state, verify_result=result, verify_ms=elapsed)
         replacements[index] = row.prompt_cache
         batch._token_context[index] = row._token_context[0]
+    if jobs:
+        candidate_draft.run_jobs(jobs, depths, bg=bg, dspark=dspark)
     bg._replace_cache_rows(batch, replacements)
     return True
 
